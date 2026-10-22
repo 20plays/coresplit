@@ -45,7 +45,8 @@ GRAY_TEXT = "#8d97a8"
 
 DANGER = "#d98080"
 
-SANS = "Noto Sans"
+SANS = "Adwaita Sans"
+SANS_FALLBACKS = ["Noto Sans", "DejaVu Sans"]
 MONO = "DejaVu Sans Mono"
 
 # -- QColor helpers --------------------------------------------------------- #
@@ -94,7 +95,8 @@ ROLE_LABEL = {"game": "Game", "test": "Tests", "other": "Unpinned"}
 # -- typography ------------------------------------------------------------- #
 
 def font(size: float, weight=QFont.Normal, mono: bool = False, spacing: float = 0.0) -> QFont:
-    face = QFont(MONO if mono else SANS)
+    face = QFont()
+    face.setFamilies([MONO] if mono else [SANS] + SANS_FALLBACKS)
     face.setPointSizeF(size)
     face.setWeight(weight)
     if spacing:
@@ -109,13 +111,12 @@ def caps_font(size: float = 8.0, weight=QFont.DemiBold, spacing: float = 1.3) ->
 # -- stylesheet ------------------------------------------------------------- #
 
 _QSS = Template("""
-QWidget { color: $TEXT; font-family: "$SANS"; font-size: 10pt; }
+QWidget { color: $TEXT; font-family: "$SANS", "Noto Sans", "DejaVu Sans", sans-serif; font-size: 10pt; }
 QMainWindow, QWidget#Root { background: $INK; }
 QWidget#ScrollContent, QWidget#ScrollViewport { background: transparent; }
 QScrollArea { background: transparent; border: none; }
 
 QLabel { background: transparent; }
-QLabel#Wordmark { font-size: 13pt; font-weight: 600; letter-spacing: 0.4px; }
 QLabel#Tagline { color: $TEXT_3; font-size: 9pt; }
 QLabel#Hint { color: $TEXT_3; font-size: 8.8pt; }
 QLabel#SettingTitle { font-size: 10pt; font-weight: 600; }

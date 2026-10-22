@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import html
 import re
+import time
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -20,7 +22,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QFontMetrics, QIcon,
-    QPainter, QPainterPath, QPen,
+    QLinearGradient, QPainter, QPainterPath, QPen, QBrush,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -406,11 +408,11 @@ class SplitSlider(QWidget):
         painter.setBrush(th.q(th.INK))
         painter.drawEllipse(QPointF(split_x, mid), radius, radius)
 
-        painter.setFont(th.caps_font(7.2, spacing=1.2))
-        painter.setPen(QPen(th.mix(th.TEXT_3_C, th.AMBER_C, 0.5)))
-        painter.drawText(QRectF(0, 0, track.left() + 40, 14), int(Qt.AlignLeft | Qt.AlignVCenter), "GAME")
-        painter.setPen(QPen(th.mix(th.TEXT_3_C, th.BLUE_C, 0.5)))
-        painter.drawText(QRectF(track.right() - 40, 0, 40, 14), int(Qt.AlignRight | Qt.AlignVCenter), "TESTS")
+        painter.setFont(th.font(8.2, QFont.DemiBold))
+        painter.setPen(QPen(th.mix(th.TEXT_3_C, th.AMBER_C, 0.55)))
+        painter.drawText(QRectF(0, 0, track.left() + 40, 16), int(Qt.AlignLeft | Qt.AlignVCenter), "Game")
+        painter.setPen(QPen(th.mix(th.TEXT_3_C, th.BLUE_C, 0.55)))
+        painter.drawText(QRectF(track.right() - 40, 0, 40, 16), int(Qt.AlignRight | Qt.AlignVCenter), "Tests")
         painter.end()
 
 
@@ -500,8 +502,8 @@ class SplitStage(QWidget):
             rect = QRectF(0, 0, width, height)
             self._panel(
                 painter, rect, radius, shared_fill, shared_border,
-                label="ALL CORES · SHARED", label_alpha=alpha * 0.9,
-                count=f"{self._total} cores", count_alpha=alpha,
+                label="All cores shared", label_alpha=alpha * 0.9,
+                count_n=f"{self._total}", count_word="cores", count_alpha=alpha,
                 sub=self._all_range, sub_alpha=alpha * 0.8,
                 cores=self._game_cores + self._other_cores,
                 dot_color=th.q("#5b6474"), label_color=th.TEXT_3_C,
@@ -519,8 +521,9 @@ class SplitStage(QWidget):
 
             self._panel(
                 painter, game_rect, radius, game_fill, game_border,
-                label="GAME", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.AMBER_TEXT), p),
-                count=f"{game_n} cores", count_alpha=fade,
+                label="Game", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.AMBER_TEXT), p),
+                count_n=f"{game_n}", count_word="core" if game_n == 1 else "cores",
+                count_alpha=fade,
                 sub=self._game_range, sub_alpha=fade * 0.85,
                 cores=self._game_cores,
                 dot_color=th.mix(th.q("#5b6474"), th.AMBER_C, p),
@@ -528,8 +531,9 @@ class SplitStage(QWidget):
             )
             self._panel(
                 painter, other_rect, radius, other_fill, other_border,
-                label="EVERYTHING ELSE", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.BLUE_TEXT), p),
-                count=f"{other_n} cores", count_alpha=fade,
+                label="Everything else", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.BLUE_TEXT), p),
+                count_n=f"{other_n}", count_word="core" if other_n == 1 else "cores",
+                count_alpha=fade,
                 sub=self._other_range, sub_alpha=fade * 0.85,
                 cores=self._other_cores,
                 dot_color=th.mix(th.q("#5b6474"), th.BLUE_C, p),
@@ -537,8 +541,8 @@ class SplitStage(QWidget):
         painter.end()
 
     def _panel(self, painter, rect: QRectF, radius, fill, border, *, label, label_alpha,
-               label_color=None, count, count_alpha, sub, sub_alpha, cores, dot_color,
-               warning=False):
+               label_color=None, count_n, count_word, count_alpha, sub, sub_alpha, cores,
+               dot_color, warning=False):
         painter.setPen(QPen(border, 1))
         painter.setBrush(fill)
         painter.drawRoundedRect(rect, radius, radius)
@@ -551,16 +555,17 @@ class SplitStage(QWidget):
         label_color = label_color or th.TEXT_3_C
         lc = QColor(label_color)
         lc.setAlphaF(max(0.0, label_alpha * 0.95))
-        painter.setFont(th.caps_font(7.8, spacing=1.5))
+        label_font = th.font(9.4, QFont.DemiBold)
+        painter.setFont(label_font)
         painter.setPen(QPen(lc))
-        painter.drawText(QRectF(rect.left() + pad, rect.top() + 18, inner_w, 14),
-                         int(Qt.AlignLeft | Qt.AlignVCenter), label)
+        label_rect = QRectF(rect.left() + pad, rect.top() + 16, inner_w, 16)
+        painter.drawText(label_rect, int(Qt.AlignLeft | Qt.AlignVCenter), label)
 
         if warning and label_alpha > 0.05:
             # Cache-domain warning: a solid amber badge after the panel label.
-            metrics = QFontMetrics(th.caps_font(7.8, spacing=1.5))
-            badge_x = rect.left() + pad + metrics.horizontalAdvance(label) + 14
-            badge_y = rect.top() + 25
+            metrics = QFontMetrics(label_font)
+            badge_x = label_rect.left() + metrics.horizontalAdvance(label) + 10
+            badge_y = label_rect.center().y()
             bc = QColor(th.AMBER)
             bc.setAlphaF(max(0.0, min(1.0, label_alpha)))
             painter.setPen(Qt.NoPen)
@@ -573,18 +578,29 @@ class SplitStage(QWidget):
             painter.drawText(QRectF(badge_x - 7, badge_y - 7, 14, 14),
                              int(Qt.AlignCenter), "!")
 
-        cc = QColor(th.TEXT_C)
-        cc.setAlphaF(max(0.0, count_alpha))
-        painter.setFont(th.font(15.5, QFont.DemiBold))
-        painter.setPen(QPen(cc))
-        painter.drawText(QRectF(rect.left() + pad, rect.top() + 34, inner_w, 24),
-                         int(Qt.AlignLeft | Qt.AlignVCenter), count)
+        # Count: a large numeral with a small unit word, baseline-aligned.
+        num_font = th.font(21, QFont.DemiBold)
+        word_font = th.font(9.8, QFont.Medium)
+        num_metrics = QFontMetrics(num_font)
+        word_metrics = QFontMetrics(word_font)
+        baseline = rect.top() + 38 + num_metrics.ascent()
+        nc = QColor(th.TEXT_C)
+        nc.setAlphaF(max(0.0, count_alpha))
+        wc = QColor(th.TEXT_2_C)
+        wc.setAlphaF(max(0.0, count_alpha * 0.85))
+        painter.setFont(num_font)
+        painter.setPen(QPen(nc))
+        painter.drawText(QPointF(rect.left() + pad, baseline), count_n)
+        painter.setFont(word_font)
+        painter.setPen(QPen(wc))
+        painter.drawText(QPointF(rect.left() + pad + num_metrics.horizontalAdvance(count_n) + 6,
+                                 baseline), count_word)
 
         sc = QColor(th.TEXT_3_C)
         sc.setAlphaF(max(0.0, sub_alpha))
         painter.setFont(th.font(8.2, mono=True))
         painter.setPen(QPen(sc))
-        painter.drawText(QRectF(rect.left() + pad, rect.top() + 58, inner_w, 14),
+        painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, inner_w, 14),
                          int(Qt.AlignLeft | Qt.AlignVCenter), sub)
 
         # One dot per physical core, sized to fit the panel.
@@ -598,6 +614,136 @@ class SplitStage(QWidget):
         for _core in cores:
             painter.drawEllipse(QPointF(x + dot / 2, cy), dot / 2, dot / 2)
             x += dot + gap
+
+
+# --------------------------------------------------------------------------- #
+# usage graph
+# --------------------------------------------------------------------------- #
+
+class UsageGraph(QWidget):
+    """Rolling CPU usage for each side of the split, as two filled curves.
+
+    Samples arrive once per engine poll (1.5 s); the plot scrolls continuously
+    between them so it reads as live rather than steppy. Percentages are of
+    each side's capacity: a full game side means every game CPU is busy.
+    """
+
+    WINDOW_SECONDS = 60.0
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(118)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._samples = deque()  # (monotonic_ts, game_pct, test_pct)
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self.update)
+
+    def add_sample(self, game_pct: float, test_pct: float):
+        now = time.monotonic()
+        self._samples.append((now, game_pct, test_pct))
+        cutoff = now - self.WINDOW_SECONDS - 5
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def showEvent(self, event):
+        if self._samples:
+            self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        frame = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(th.q(th.LINE_SOFT), 1))
+        painter.setBrush(th.q(th.SURFACE))
+        painter.drawRoundedRect(frame, 16, 16)
+
+        pad_l, pad_r, pad_t, pad_b = 16.0, 16.0, 32.0, 12.0
+        plot = QRectF(pad_l, pad_t, self.width() - pad_l - pad_r,
+                      self.height() - pad_t - pad_b)
+        now = time.monotonic()
+        rate = plot.width() / self.WINDOW_SECONDS
+
+        # Midline at 50% of capacity, and the baseline.
+        pen = QPen(th.LINE_C, 1)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(plot.left(), plot.center().y()),
+                         QPointF(plot.right(), plot.center().y()))
+
+        def series(index, accent):
+            points = []
+            for t, g, tl in self._samples:
+                value = (g, tl)[index]
+                x = plot.right() - (now - t) * rate
+                if x < plot.left():
+                    continue
+                y = plot.bottom() - (value / 100.0) * plot.height()
+                points.append((x, max(plot.top(), min(plot.bottom(), y))))
+            if not points:
+                return None
+            path = QPainterPath(QPointF(*points[0]))
+            for i in range(1, len(points)):
+                x0, y0 = points[i - 1]
+                x1, y1 = points[i]
+                mid = QPointF((x0 + x1) / 2, (y0 + y1) / 2)
+                path.quadTo(QPointF(x0, y0), mid)
+                path.lineTo(QPointF(x1, y1))
+            fill = QPainterPath(path)
+            fill.lineTo(points[-1][0], plot.bottom())
+            fill.lineTo(points[0][0], plot.bottom())
+            fill.closeSubpath()
+            grad = QLinearGradient(0, plot.top(), 0, plot.bottom())
+            grad.setColorAt(0.0, th.tint(accent, 75))
+            grad.setColorAt(1.0, th.tint(accent, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(grad))
+            painter.drawPath(fill)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(th.tint(accent, 230), 1.6))
+            painter.drawPath(path)
+            lx, ly = points[-1]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(accent)
+            painter.drawEllipse(QPointF(lx, ly), 2.6, 2.6)
+            return points[-1]
+
+        series(0, th.AMBER_C)
+        series(1, th.BLUE_C)
+
+        # Legend with the live values.
+        painter.setFont(th.font(8.8, QFont.DemiBold))
+        if self._samples:
+            _, g, t = self._samples[-1]
+            left_text = f"Game side · {g:.0f}%"
+            right_text = f"{t:.0f}% · Test side"
+        else:
+            left_text, right_text = "Game side", "Test side"
+        legend_y = 20.0
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(th.AMBER_C)
+        painter.drawEllipse(QPointF(pad_l + 3, legend_y), 3.2, 3.2)
+        painter.setPen(QPen(th.TEXT_2_C))
+        painter.drawText(QPointF(pad_l + 12, legend_y + 4), left_text)
+        right_metrics = QFontMetrics(painter.font())
+        right_w = right_metrics.horizontalAdvance(right_text)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(th.BLUE_C)
+        painter.drawEllipse(QPointF(self.width() - pad_r - right_w - 11, legend_y), 3.2, 3.2)
+        painter.setPen(QPen(th.TEXT_2_C))
+        painter.drawText(QPointF(self.width() - pad_r - right_w, legend_y + 4), right_text)
+
+        if len(self._samples) < 2:
+            painter.setFont(th.font(8.8))
+            painter.setPen(QPen(th.TEXT_3_C))
+            painter.drawText(plot, int(Qt.AlignCenter), "gathering samples…")
+        painter.end()
 
 
 # --------------------------------------------------------------------------- #
@@ -824,8 +970,8 @@ class MainWindow(QMainWindow):
         self.bridge = bridge
         self.cfg = config
         self.setWindowTitle("CoreSplit")
-        self.resize(1000, 700)
-        self.setMinimumSize(880, 640)
+        self.resize(1000, 780)
+        self.setMinimumSize(880, 700)
         self._pending_mode: str | None = None
         self._mode = "off"
         self._pending_timer = QTimer(self)
@@ -861,8 +1007,10 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(28, 18, 20, 14)
         row.setSpacing(4)
 
-        wordmark = QLabel("CoreSplit")
-        wordmark.setObjectName("Wordmark")
+        wordmark = QLabel(
+            f'<span style="font-weight:600; color:{th.TEXT};">Core</span>'
+            f'<span style="font-weight:850; color:{th.TEXT};">Split</span>')
+        wordmark.setTextFormat(Qt.RichText)
         row.addWidget(wordmark)
         row.addStretch(1)
 
@@ -889,8 +1037,10 @@ class MainWindow(QMainWindow):
         column = QVBoxLayout()
         column.setSpacing(0)
 
-        self.eyebrow = caps("Starting…", th.TEXT_3, 8.4)
+        self.eyebrow = QLabel("Starting…")
+        self.eyebrow.setFont(th.font(10.6, QFont.DemiBold))
         self.eyebrow.setAlignment(Qt.AlignCenter)
+        self.eyebrow.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
         column.addWidget(self.eyebrow)
         column.addSpacing(10)
 
@@ -917,7 +1067,16 @@ class MainWindow(QMainWindow):
         stage_holder.addStretch(1)
         column.addLayout(stage_holder)
 
-        column.addSpacing(20)
+        column.addSpacing(12)
+
+        graph_holder = QHBoxLayout()
+        graph_holder.addStretch(1)
+        self.graph = UsageGraph()
+        graph_holder.addWidget(self.graph, 12)
+        graph_holder.addStretch(1)
+        column.addLayout(graph_holder)
+
+        column.addSpacing(16)
 
         slider_holder = QHBoxLayout()
         slider_holder.addStretch(1)
@@ -1301,6 +1460,15 @@ class MainWindow(QMainWindow):
             self.slider.set_game_cores(
                 self.engine.topo.core_count(eng.parse_cpulist(snap["game_cpus"])))
         self._update_slider_caption(snap["game_cpus"], snap["test_cpus"])
+
+        # Per-side usage as a share of each side's capacity.
+        g_cpu = sum(row["cpu"] for row in snap["procs"] if row["role"] == "game")
+        t_cpu = sum(row["cpu"] for row in snap["procs"] if row["role"] == "test")
+        g_cap = max(1, len(eng.parse_cpulist(snap["game_cpus"])))
+        t_cap = max(1, len(eng.parse_cpulist(snap["test_cpus"])))
+        self.graph.add_sample(min(100.0, 100.0 * g_cpu / g_cap),
+                              min(100.0, 100.0 * t_cpu / t_cap))
+
         self._update_status_text(snap)
         self.model.set_rows(snap["procs"])
         self._update_split_hint()
@@ -1340,17 +1508,17 @@ class MainWindow(QMainWindow):
         counts = snap["counts"]
 
         if mode == "off":
-            self.eyebrow.setText("OFF · EVERYTHING SHARED")
+            self.eyebrow.setText("Off · everything shared")
             self.eyebrow.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
             self.title.setText("Nothing is pinned")
             self.subtitle.setText(
                 f"All {self.engine.topo.core_count(self.engine.topo.all_cpus)} physical cores "
                 "serve whatever you run.")
         else:
-            word = "HARD SPLIT" if mode == "hard" else "SMART SPLIT"
+            word = "Hard split" if mode == "hard" else "Smart split"
             accent = th.AMBER_TEXT if mode == "hard" else th.BLUE_TEXT
             if game:
-                self.eyebrow.setText(f"{word} · PROTECTING")
+                self.eyebrow.setText(f"{word} · protecting")
                 self.eyebrow.setStyleSheet(f"color: {accent}; background: transparent;")
                 self.title.setText(game["name"])
                 n = counts.get("game", 0)
@@ -1358,13 +1526,11 @@ class MainWindow(QMainWindow):
                     f"{n} process{'es' if n != 1 else ''} on the game side · "
                     f"detected via {game['reason']}")
             else:
-                self.eyebrow.setText(f"{word} · STANDBY")
+                self.eyebrow.setText(f"{word} · active")
                 self.eyebrow.setStyleSheet(f"color: {accent}; background: transparent;")
-                self.title.setText("Waiting for a game")
-                if snap.get("auto"):
-                    self.subtitle.setText("The split engages the moment a game starts.")
-                else:
-                    self.subtitle.setText("Start a game and CoreSplit will follow.")
+                self.title.setText("No game running")
+                self.subtitle.setText(
+                    "The split is already applied — everything else is parked on the test side.")
 
         self.mode_desc.setText(MODE_DESCRIPTIONS.get(mode, MODE_DESCRIPTIONS["off"]))
 
