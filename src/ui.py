@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""CoreSplit GUI: a quiet dark interface built around one status card.
+"""CoreSplit GUI: one calm stage built around the chip itself.
 
-Everything visual is custom painted where the stock widget look would show:
-the mode selector is a sliding segmented control, the CPU view is a small
-topology diagram, and the process table draws its own rows and role chips.
+The window answers a single question — *is the machine split right now?* —
+with a large visualisation of the CPU that splits into its two halves when a
+mode engages and heals back into one when it doesn't. Mode selection sits
+directly beneath it; processes and settings live one quiet nav click away.
+Everything visual is custom painted where the stock widget look would show.
 """
 
 from __future__ import annotations
 
 import html
-import os
 import re
 from pathlib import Path
 
 from PySide6.QtCore import (
     QAbstractTableModel, QEasingCurve, QModelIndex, QObject, QPointF, QRectF, QSize,
-    Qt, QVariantAnimation, Signal,
+    Qt, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QActionGroup, QBrush, QColor, QFont, QFontMetrics, QIcon, QLinearGradient,
-    QPainter, QPainterPath, QPen, QPixmap,
+    QAction, QActionGroup, QColor, QFont, QFontMetrics, QIcon,
+    QPainter, QPen,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStyle,
-    QStyledItemDelegate, QSystemTrayIcon, QTableView, QTabWidget, QTextEdit,
-    QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QStackedLayout,
+    QStackedWidget, QStyle, QStyledItemDelegate, QSystemTrayIcon, QTableView,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 import engine as eng
@@ -69,14 +70,387 @@ def variant(button: QPushButton, name: str) -> QPushButton:
     return button
 
 
+def fmt_range(spec: str) -> str:
+    """0-5,12-17 -> 0–5 · 12–17, for display only."""
+    return " · ".join(part.strip().replace("-", "–") for part in spec.split(",") if part.strip())
+
+
+# --------------------------------------------------------------------------- #
+# switch: an animated pill toggle
+# --------------------------------------------------------------------------- #
+
+class Switch(QWidget):
+    """A small pill switch with QCheckBox's essential API surface."""
+
+    toggled = Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(42, 24)
+        self.setCursor(Qt.PointingHandCursor)
+        self._checked = False
+        self._pos = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(150)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool):
+        """Programmatic change: moves the thumb without emitting toggled."""
+        checked = bool(checked)
+        if checked == self._checked:
+            self._pos = 1.0 if checked else 0.0
+            self.update()
+            return
+        self._checked = checked
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def _on_anim(self, value):
+        self._pos = float(value)
+        self.update()
+
+    def _flip(self):
+        self._checked = not self._checked
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if self._checked else 0.0)
+        self._anim.start()
+        self.toggled.emit(self._checked)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self._flip()
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return):
+            self._flip()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        track = QRectF(0, 0, 42, 24)
+        if self._checked or self._pos > 0.0:
+            fill = th.mix(th.q(th.SURFACE_3), th.AMBER_C, self._pos)
+            border = th.mix(th.LINE_C, th.AMBER_C, self._pos)
+        else:
+            fill = th.q(th.SURFACE_3)
+            border = th.LINE_C
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(track.adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
+
+        x = 3.0 + self._pos * (42 - 24 - 3)
+        thumb = th.mix(th.q("#8d97a8"), th.q("#221708"), self._pos)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(thumb)
+        painter.drawEllipse(QPointF(x + 9, 12), 8.0, 8.0)
+        painter.end()
+
+
+# --------------------------------------------------------------------------- #
+# mode selector
+# --------------------------------------------------------------------------- #
+
+class ModeSelector(QWidget):
+    """Three-way selector with a sliding thumb. The one primary control."""
+
+    changed = Signal(str)
+    OPTIONS = (("off", "Off"), ("smart", "Smart"), ("hard", "Hard"))
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(380, 48)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._index = 0
+        self._pos = 0.0
+        self._hover = -1
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+
+    def mode(self) -> str:
+        return self.OPTIONS[self._index][0]
+
+    def set_mode(self, mode: str):
+        for index, (key, _) in enumerate(self.OPTIONS):
+            if key != mode:
+                continue
+            if index == self._index:
+                return
+            if not self.isVisible():
+                self._index = index
+                self._pos = float(index)
+                self.update()
+                return
+            self._anim.stop()
+            self._anim.setStartValue(float(self._pos))
+            self._anim.setEndValue(float(index))
+            self._anim.start()
+            self._index = index
+            return
+
+    def _on_anim(self, value):
+        self._pos = float(value)
+        self.update()
+
+    def _segment_rect(self, index) -> QRectF:
+        rect = QRectF(self.rect()).adjusted(4, 4, -4, -4)
+        width = rect.width() / len(self.OPTIONS)
+        return QRectF(rect.left() + index * width, rect.top(), width, rect.height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        track = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(th.LINE_C, 1))
+        painter.setBrush(th.q(th.SURFACE))
+        painter.drawRoundedRect(track, 22, 22)
+
+        key = self.mode()
+        accent = {"off": th.q("#262d3a"), "smart": th.BLUE_C, "hard": th.AMBER_C}[key]
+        thumb = self._segment_rect(self._pos)
+        painter.setPen(QPen(th.q("#3d4655"), 1) if key == "off" else Qt.NoPen)
+        painter.setBrush(accent)
+        painter.drawRoundedRect(thumb, 18, 18)
+
+        label_font = th.font(10.2, QFont.DemiBold)
+        painter.setFont(label_font)
+        for index, (option_key, label) in enumerate(self.OPTIONS):
+            segment = self._segment_rect(index)
+            if index == self._index:
+                color = th.q("#221708") if option_key != "off" else th.TEXT_C
+            elif index == self._hover:
+                color = th.TEXT_C
+            else:
+                color = th.TEXT_3_C
+            painter.setPen(QPen(color))
+            painter.drawText(segment, int(Qt.AlignCenter), label)
+        painter.end()
+
+    def _index_at(self, x: float) -> int:
+        rect = QRectF(self.rect()).adjusted(4, 4, -4, -4)
+        width = rect.width() / len(self.OPTIONS)
+        return max(0, min(len(self.OPTIONS) - 1, int((x - rect.left()) // width)))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            index = self._index_at(event.position().x())
+            if index != self._index:
+                self._index = index
+                self._pos = float(index)
+                self.update()
+                self.changed.emit(self.OPTIONS[index][0])
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        index = self._index_at(event.position().x())
+        if index != self._hover:
+            self._hover = index
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Left, Qt.Key_Right):
+            step = -1 if event.key() == Qt.Key_Left else 1
+            index = max(0, min(len(self.OPTIONS) - 1, self._index + step))
+            if index != self._index:
+                self._index = index
+                self._pos = float(index)
+                self.update()
+                self.changed.emit(self.OPTIONS[index][0])
+            return
+        super().keyPressEvent(event)
+
+
+# --------------------------------------------------------------------------- #
+# split stage: the chip, drawn as it splits and heals
+# --------------------------------------------------------------------------- #
+
+class SplitStage(QWidget):
+    """One panel when everything is shared; two when a split is engaged.
+
+    Panel widths are proportional to the physical cores on each side, so the
+    8/4 preset reads at a glance. The transition between the two states is the
+    whole point: the machine visibly comes apart and back together.
+    """
+
+    HEIGHT = 196
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(self.HEIGHT)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._game_cores: list[list[int]] = []
+        self._other_cores: list[list[int]] = []
+        self._game_range = ""
+        self._other_range = ""
+        self._all_range = ""
+        self._total = 0
+        self._pos = 0.0
+        self._target = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(420)
+        self._anim.setEasingCurve(QEasingCurve.InOutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+
+    def set_data(self, topo, game_cpus, test_cpus, active: bool):
+        game = eng.parse_cpulist(game_cpus)
+        test = eng.parse_cpulist(test_cpus)
+        self._game_cores = [core for core in topo.physical_cores() if set(core) & game]
+        self._other_cores = [core for core in topo.physical_cores() if core not in self._game_cores]
+        self._total = len(self._game_cores) + len(self._other_cores)
+        self._game_range = fmt_range(eng.format_cpulist(sorted(game)))
+        self._other_range = fmt_range(eng.format_cpulist(sorted(test)))
+        self._all_range = fmt_range(eng.format_cpulist(topo.all_cpus))
+        target = 1.0 if active else 0.0
+        if target != self._target:
+            self._target = target
+            if not self.isVisible():
+                self._pos = target
+                self.update()
+                return
+            self._anim.stop()
+            self._anim.setStartValue(self._pos)
+            self._anim.setEndValue(target)
+            self._anim.start()
+
+    def _on_anim(self, value):
+        self._pos = float(value)
+        self.update()
+
+    # -- painting ---------------------------------------------------------- #
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        if not self._total:
+            painter.end()
+            return
+
+        p = self._pos
+        width = self.width()
+        height = float(self.HEIGHT)
+        radius = 24.0
+
+        game_fill = th.mix(th.q(th.SURFACE), th.tint(th.AMBER_C, 30), p)
+        game_border = th.mix(th.LINE_C, th.tint(th.AMBER_C, 90), p)
+        other_fill = th.mix(th.q(th.SURFACE), th.tint(th.BLUE_C, 24), p)
+        other_border = th.mix(th.LINE_C, th.tint(th.BLUE_C, 74), p)
+        shared_fill = th.q(th.SURFACE)
+        shared_border = th.LINE_C
+
+        if p < 0.995:
+            # Shared state: a single quiet panel holding every core.
+            alpha = 1.0 - p
+            rect = QRectF(0, 0, width, height)
+            self._panel(
+                painter, rect, radius, shared_fill, shared_border,
+                label="ALL CORES · SHARED", label_alpha=alpha * 0.9,
+                count=f"{self._total} cores", count_alpha=alpha,
+                sub=self._all_range, sub_alpha=alpha * 0.8,
+                cores=self._game_cores + self._other_cores,
+                dot_color=th.q("#5b6474"), label_color=th.TEXT_3_C,
+            )
+
+        if p > 0.005:
+            gap = 34.0 * p
+            game_n = max(1, len(self._game_cores))
+            other_n = max(1, len(self._other_cores))
+            usable = width - gap
+            game_w = usable * game_n / self._total
+            game_rect = QRectF(0, 0, game_w, height)
+            other_rect = QRectF(game_w + gap, 0, usable - game_w, height)
+            fade = max(0.0, (p - 0.25) / 0.75)  # text arrives as the gap opens
+
+            self._panel(
+                painter, game_rect, radius, game_fill, game_border,
+                label="GAME", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.AMBER_TEXT), p),
+                count=f"{game_n} cores", count_alpha=fade,
+                sub=self._game_range, sub_alpha=fade * 0.85,
+                cores=self._game_cores,
+                dot_color=th.mix(th.q("#5b6474"), th.AMBER_C, p),
+            )
+            self._panel(
+                painter, other_rect, radius, other_fill, other_border,
+                label="EVERYTHING ELSE", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.BLUE_TEXT), p),
+                count=f"{other_n} cores", count_alpha=fade,
+                sub=self._other_range, sub_alpha=fade * 0.85,
+                cores=self._other_cores,
+                dot_color=th.mix(th.q("#5b6474"), th.BLUE_C, p),
+            )
+        painter.end()
+
+    def _panel(self, painter, rect: QRectF, radius, fill, border, *, label, label_alpha,
+               label_color=None, count, count_alpha, sub, sub_alpha, cores, dot_color):
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        pad = 24.0
+        inner_w = rect.width() - pad * 2
+        if inner_w < 40:
+            return
+
+        label_color = label_color or th.TEXT_3_C
+        lc = QColor(label_color)
+        lc.setAlphaF(max(0.0, label_alpha * 0.95))
+        painter.setFont(th.caps_font(7.8, spacing=1.5))
+        painter.setPen(QPen(lc))
+        painter.drawText(QRectF(rect.left() + pad, rect.top() + 18, inner_w, 14),
+                         int(Qt.AlignLeft | Qt.AlignVCenter), label)
+
+        cc = QColor(th.TEXT_C)
+        cc.setAlphaF(max(0.0, count_alpha))
+        painter.setFont(th.font(15.5, QFont.DemiBold))
+        painter.setPen(QPen(cc))
+        painter.drawText(QRectF(rect.left() + pad, rect.top() + 34, inner_w, 24),
+                         int(Qt.AlignLeft | Qt.AlignVCenter), count)
+
+        sc = QColor(th.TEXT_3_C)
+        sc.setAlphaF(max(0.0, sub_alpha))
+        painter.setFont(th.font(8.2, mono=True))
+        painter.setPen(QPen(sc))
+        painter.drawText(QRectF(rect.left() + pad, rect.top() + 58, inner_w, 14),
+                         int(Qt.AlignLeft | Qt.AlignVCenter), sub)
+
+        # One dot per physical core, sized to fit the panel.
+        n = max(1, len(cores))
+        gap = 9.0
+        dot = max(6.0, min(13.0, (inner_w - gap * (n - 1)) / n))
+        cy = rect.bottom() - 24.0
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(dot_color)
+        x = rect.left() + pad
+        for _core in cores:
+            painter.drawEllipse(QPointF(x + dot / 2, cy), dot / 2, dot / 2)
+            x += dot + gap
+
+
 # --------------------------------------------------------------------------- #
 # process table
 # --------------------------------------------------------------------------- #
 
 class ProcessModel(QAbstractTableModel):
-    HEADERS = ["PID", "Process", "CPU", "Role", "Affinity", "Threads", "Scope"]
-    WIDTHS = [80, 250, 64, 104, 124, 70, 230]
-    NUMERIC = (0, 2, 5)
+    HEADERS = ["Process", "CPU", "Threads", "Role", "Affinity"]
+    WIDTHS = [340, 84, 92, 132, 150]
+    NUMERIC = (1, 2)
     RoleKind = Qt.UserRole + 1
 
     def __init__(self):
@@ -123,7 +497,7 @@ class ProcessModel(QAbstractTableModel):
         if orientation != Qt.Horizontal:
             return None
         if role == Qt.DisplayRole:
-            return self.HEADERS[section]
+            return self.HEADERS[section].upper()
         if role == Qt.TextAlignmentRole:
             side = Qt.AlignRight if section in self.NUMERIC else Qt.AlignLeft
             return int(side | Qt.AlignVCenter)
@@ -136,19 +510,15 @@ class ProcessModel(QAbstractTableModel):
         column = index.column()
         if role == Qt.DisplayRole:
             if column == 0:
-                return str(row["pid"])
-            if column == 1:
                 return row["name"]
-            if column == 2:
+            if column == 1:
                 return f"{row['cpu']:.1f}"
+            if column == 2:
+                return str(row["threads"])
             if column == 3:
                 return th.ROLE_LABEL.get(row["role"], row["role"])
             if column == 4:
-                return row["affinity"]
-            if column == 5:
-                return str(row["threads"])
-            if column == 6:
-                return row["scope"]
+                return fmt_range(row["affinity"]) if row["affinity"] != "?" else "?"
         elif role == self.RoleKind:
             return row["role"]
         elif role == Qt.TextAlignmentRole and column in self.NUMERIC:
@@ -165,14 +535,15 @@ class ProcessModel(QAbstractTableModel):
 
 
 class ProcDelegate(QStyledItemDelegate):
-    """Paints rows without gridlines: tinted hover, role chips, leading dot."""
+    """Quiet rows: the name carries a pid sub-line, roles are a dot and a word."""
 
     def __init__(self):
         super().__init__()
-        self.sans = th.font(9.6)
+        self.sans = th.font(9.8)
+        self.sub = th.font(7.9)
         self.mono = th.font(8.8, mono=True)
-        self.chip = th.font(8.2, QFont.DemiBold)
-        self.pad = 12
+        self.role_font = th.font(8.8, QFont.DemiBold)
+        self.pad = 16
 
     def paint(self, painter, option, index):
         painter.save()
@@ -183,28 +554,25 @@ class ProcDelegate(QStyledItemDelegate):
 
         if selected:
             painter.setPen(Qt.NoPen)
-            painter.setBrush(th.tint(th.AMBER_C, 34))
-            painter.drawRoundedRect(rect.adjusted(4, 2, -4, -2), 7, 7)
+            painter.setBrush(th.tint(th.AMBER_C, 30))
+            painter.drawRoundedRect(rect.adjusted(6, 3, -6, -3), 9, 9)
         elif hovered:
             painter.setPen(Qt.NoPen)
-            painter.setBrush(th.tint(th.TEXT_C, 9))
-            painter.drawRoundedRect(rect.adjusted(4, 2, -4, -2), 7, 7)
+            painter.setBrush(th.tint(th.TEXT_C, 8))
+            painter.drawRoundedRect(rect.adjusted(6, 3, -6, -3), 9, 9)
 
         column = index.column()
         role = index.data(ProcessModel.RoleKind)
         text = index.data(Qt.DisplayRole) or ""
 
-        if column == 3:
-            self._chip(painter, rect, text, role)
-        elif column == 1:
-            self._name(painter, rect, text, role)
+        if column == 0:
+            self._name(painter, rect, index, role)
+        elif column == 3:
+            self._role(painter, rect, text, role)
         else:
-            mono = column in (0, 2, 4, 5)
-            align = Qt.AlignRight if column in (0, 2, 5) else Qt.AlignLeft
-            color = th.TEXT_2_C if column == 6 else th.TEXT_C
-            if column == 4:
-                color = th.TEXT_2_C
-            self._text(painter, rect, text, mono, align, color)
+            align = Qt.AlignRight if column in ProcessModel.NUMERIC else Qt.AlignLeft
+            color = th.TEXT_2_C if column == 4 else th.TEXT_C
+            self._text(painter, rect, text, column in (1, 2, 4), align, color)
         painter.restore()
 
     def _text(self, painter, rect, text, mono, align, color):
@@ -215,382 +583,82 @@ class ProcDelegate(QStyledItemDelegate):
         elided = metrics.elidedText(text, Qt.ElideRight, int(inner.width()))
         painter.drawText(inner, int(align | Qt.AlignVCenter), elided)
 
-    def _chip(self, painter, rect, text, role):
+    def _role(self, painter, rect, text, role):
         accent = th.ROLE_ACCENT.get(role, th.GRAY_C)
-        painter.setFont(self.chip)
-        metrics = QFontMetrics(painter.font())
-        width = metrics.horizontalAdvance(text) + 20
-        chip = QRectF(rect.left() + self.pad, rect.center().y() - 10, width, 20)
+        text_color = th.ROLE_TEXT.get(role, th.GRAY_TEXT) if role != "other" else th.TEXT_3
         painter.setPen(Qt.NoPen)
-        painter.setBrush(th.tint(accent, 40 if role != "other" else 22))
-        painter.drawRoundedRect(chip, 10, 10)
-        painter.setPen(QPen(QColor(th.ROLE_TEXT.get(role, th.GRAY_TEXT))))
-        painter.drawText(chip, int(Qt.AlignCenter), text)
-
-    def _name(self, painter, rect, text, role):
-        accent = th.ROLE_ACCENT.get(role, th.GRAY_C)
-        dot_x = rect.left() + self.pad
-        if role != "other":
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(accent)
-            painter.drawEllipse(QPointF(dot_x + 3, rect.center().y()), 3.0, 3.0)
-        painter.setFont(self.sans)
-        painter.setPen(QPen(th.TEXT_C))
-        inner = rect.adjusted(self.pad + 14, 0, -8, 0)
+        painter.setBrush(accent)
+        dot_x = rect.left() + self.pad + 3.5
+        painter.drawEllipse(QPointF(dot_x, rect.center().y()), 3.5, 3.5)
+        painter.setFont(self.role_font)
+        painter.setPen(QPen(QColor(text_color)))
+        inner = rect.adjusted(self.pad + 12, 0, -self.pad, 0)
         metrics = QFontMetrics(painter.font())
         elided = metrics.elidedText(text, Qt.ElideRight, int(inner.width()))
         painter.drawText(inner, int(Qt.AlignLeft | Qt.AlignVCenter), elided)
 
+    def _name(self, painter, rect, index, role):
+        name = index.data(Qt.DisplayRole) or ""
+        pid_line = ""
+        row = index.row()
+        model = index.model()
+        if model is not None and 0 <= row < model.rowCount():
+            pid_line = f"pid {model._visible[row]['pid']}"
+            scope = model._visible[row]["scope"]
+            if scope:
+                pid_line += f" · {scope}"
+        painter.setFont(self.sans)
+        painter.setPen(QPen(th.TEXT_C))
+        top = QRectF(rect.left() + self.pad, rect.top() + 6, rect.width() - self.pad - 12, 17)
+        metrics = QFontMetrics(self.sans)
+        painter.drawText(top, int(Qt.AlignLeft | Qt.AlignVCenter),
+                         metrics.elidedText(name, Qt.ElideRight, int(top.width())))
+        if pid_line:
+            painter.setFont(self.sub)
+            painter.setPen(QPen(th.TEXT_3_C))
+            bottom = QRectF(rect.left() + self.pad, rect.top() + 22, rect.width() - self.pad - 12, 13)
+            metrics = QFontMetrics(self.sub)
+            painter.drawText(bottom, int(Qt.AlignLeft | Qt.AlignVCenter),
+                             metrics.elidedText(pid_line, Qt.ElideMiddle, int(bottom.width())))
+
 
 # --------------------------------------------------------------------------- #
-# mode selector
+# settings row
 # --------------------------------------------------------------------------- #
 
-class SegmentedControl(QWidget):
-    """Three-way selector with a sliding indicator."""
+class SettingRow(QWidget):
+    """Title and description on the left, control on the right."""
 
-    changed = Signal(str)
-    OPTIONS = (("off", "Off"), ("smart", "Smart"), ("hard", "Hard"))
-
-    def __init__(self):
+    def __init__(self, title: str, description: str, control: QWidget | None = None):
         super().__init__()
-        self.setFixedHeight(42)
-        self.setMinimumWidth(312)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self._index = 0
-        self._pos = 0.0
-        self._hover = -1
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(200)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._anim.valueChanged.connect(self._on_anim)
-
-    def mode(self) -> str:
-        return self.OPTIONS[self._index][0]
-
-    def set_mode(self, mode: str):
-        for index, (key, _) in enumerate(self.OPTIONS):
-            if key != mode:
-                continue
-            if index == self._index:
-                return
-            if not self.isVisible():
-                # No point animating a control the user cannot see yet.
-                self._index = index
-                self._pos = float(index)
-                self.update()
-                return
-            self._anim.stop()
-            self._anim.setStartValue(float(self._pos))
-            self._anim.setEndValue(float(index))
-            self._anim.start()
-            self._index = index
-            return
-
-    def _on_anim(self, value):
-        self._pos = float(value)
-        self.update()
-
-    def _segment_rect(self, index) -> QRectF:
-        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        width = rect.width() / len(self.OPTIONS)
-        return QRectF(rect.left() + index * width, rect.top(), width, rect.height())
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        track = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setPen(QPen(th.LINE_C, 1))
-        painter.setBrush(th.q(th.SURFACE_2))
-        painter.drawRoundedRect(track, 11, 11)
-
-        key = self.mode()
-        accent = {"off": th.q(th.SURFACE_3), "smart": th.BLUE_C, "hard": th.AMBER_C}[key]
-        inner = self._segment_rect(self._pos).adjusted(3, 3, -3, -3)
-        painter.setPen(QPen(th.tint(th.TEXT_C, 20), 1) if key == "off" else Qt.NoPen)
-        painter.setBrush(accent)
-        painter.drawRoundedRect(inner, 8, 8)
-
-        label_font = th.font(9.4, QFont.DemiBold)
-        painter.setFont(label_font)
-        for index, (option_key, label) in enumerate(self.OPTIONS):
-            segment = self._segment_rect(index)
-            if index == self._index:
-                color = QColor("#17120a") if option_key != "off" else th.TEXT_C
-            elif index == self._hover:
-                color = th.TEXT_C
-            else:
-                color = th.TEXT_3_C
-            painter.setPen(QPen(color))
-            painter.drawText(segment, int(Qt.AlignCenter), label)
-        painter.end()
-
-    def _index_at(self, x: float) -> int:
-        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        width = rect.width() / len(self.OPTIONS)
-        return max(0, min(len(self.OPTIONS) - 1, int((x - rect.left()) // width)))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            index = self._index_at(event.position().x())
-            if index != self._index:
-                self._index = index
-                self._pos = float(index)
-                self.update()
-                self.changed.emit(self.OPTIONS[index][0])
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        index = self._index_at(event.position().x())
-        if index != self._hover:
-            self._hover = index
-            self.update()
-        super().mouseMoveEvent(event)
-
-    def leaveEvent(self, event):
-        self._hover = -1
-        self.update()
-        super().leaveEvent(event)
-
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Left, Qt.Key_Right):
-            step = -1 if event.key() == Qt.Key_Left else 1
-            index = max(0, min(len(self.OPTIONS) - 1, self._index + step))
-            if index != self._index:
-                self._index = index
-                self._pos = float(index)
-                self.update()
-                self.changed.emit(self.OPTIONS[index][0])
-            return
-        super().keyPressEvent(event)
-
-
-# --------------------------------------------------------------------------- #
-# cpu topology diagram
-# --------------------------------------------------------------------------- #
-
-class CpuStrip(QWidget):
-    """Each core is one pill; its two halves are the SMT threads.
-
-    Grouping by CCD (rather than by CPU number) matters: on this machine a CCD is
-    0-5 plus 12-17, so a numeric strip would interleave the two halves.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(56)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._blocks: list[tuple[str, QColor, list[list[int]]]] = []
-
-    def set_data(self, ccds, siblings, game, test):
-        self._blocks = []
-        for index, group in enumerate(ccds):
-            cores, seen = [], set()
-            for cpu in group:
-                key = tuple(siblings.get(cpu, [cpu]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                cores.append([c for c in key if c in group] or [cpu])
-            members = set(sum(cores, []))
-            if members and members <= set(game):
-                role, color = "GAME", th.AMBER_C
-            elif members and members <= set(test):
-                role, color = "TESTS", th.BLUE_C
-            else:
-                role, color = "SHARED", th.TEXT_3_C
-            self._blocks.append((f"CCD {index + 1} · {role}", color, cores))
-        self._game = set(game)
-        self._test = set(test)
-        self.update()
-
-    def _color(self, cpu) -> QColor:
-        if cpu in self._game:
-            return th.AMBER_C
-        if cpu in self._test:
-            return th.BLUE_C
-        return th.GRAY_C
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        if not self._blocks:
-            painter.end()
-            return
-
-        width = self.width()
-        gap = 26.0
-        block_w = (width - gap * (len(self._blocks) - 1)) / len(self._blocks)
-        label_h, pill_h = 15.0, 32.0
-        top = label_h + 4
-
-        for block_index, (label, color, cores) in enumerate(self._blocks):
-            x0 = block_index * (block_w + gap)
-            painter.setFont(th.caps_font(7.6, spacing=1.2))
-            painter.setPen(QPen(color))
-            painter.drawText(QRectF(x0, 0, block_w, label_h),
-                             int(Qt.AlignLeft | Qt.AlignVCenter), label)
-
-            inner_gap = 5.0
-            pill_w = (block_w - inner_gap * (len(cores) - 1)) / max(1, len(cores))
-            for core_index, core in enumerate(cores):
-                self._pill(painter, x0 + core_index * (pill_w + inner_gap), top, pill_w, pill_h, core)
-        painter.end()
-
-    def _pill(self, painter, x, y, width, height, core):
-        rect = QRectF(x, y, width, height)
-        path = QPainterPath()
-        path.addRoundedRect(rect, 7, 7)
-
-        painter.save()
-        painter.setClipPath(path)
-        if len(core) >= 2:
-            half = width / 2
-            painter.fillRect(QRectF(x, y, half, height), self._color(core[0]))
-            painter.fillRect(QRectF(x + half, y, half, height), self._color(core[1]))
-        else:
-            painter.fillRect(rect, self._color(core[0]))
-
-        sheen = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        sheen.setColorAt(0.0, QColor(255, 255, 255, 34))
-        sheen.setColorAt(0.55, QColor(255, 255, 255, 0))
-        painter.fillRect(rect, sheen)
-        painter.restore()
-
-        if len(core) >= 2:
-            painter.setPen(QPen(th.INK_C, 1))
-            painter.drawLine(QPointF(x + width / 2, y + 3), QPointF(x + width / 2, y + height - 3))
-
-        number_font = th.font(7.2 if width > 30 else 6.4, QFont.DemiBold, mono=True)
-        painter.setFont(number_font)
-        if len(core) >= 2:
-            half = width / 2
-            self._number(painter, QRectF(x, y, half, height), core[0])
-            self._number(painter, QRectF(x + half, y, half, height), core[1])
-        else:
-            self._number(painter, rect, core[0])
-
-    def _number(self, painter, rect, cpu):
-        painter.setPen(QPen(th.tint(th.INK_C, 210)))
-        painter.drawText(rect, int(Qt.AlignCenter), str(cpu))
-
-
-# --------------------------------------------------------------------------- #
-# status card
-# --------------------------------------------------------------------------- #
-
-class StatBlock(QWidget):
-    def __init__(self, label: str, color: QColor):
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(1)
-        self.value = QLabel("0")
-        self.value.setFont(th.font(18, QFont.DemiBold))
-        self.value.setStyleSheet(f"color: {color.name()}; background: transparent;")
-        self.value.setAlignment(Qt.AlignRight)
-        caption = caps(label, th.TEXT_3, 7.4)
-        caption.setAlignment(Qt.AlignRight)
-        layout.addWidget(self.value)
-        layout.addWidget(caption)
-
-    def set_value(self, number: int):
-        self.value.setText(str(number))
-
-
-class StatusCard(QFrame):
-    def __init__(self, config):
-        super().__init__()
-        self.setObjectName("Card")
-        self.cfg = config
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 18, 24, 16)
-        root.setSpacing(12)
-
-        top = QHBoxLayout()
-        top.setSpacing(18)
-
-        left = QVBoxLayout()
-        left.setSpacing(3)
-        self.mode_caps = caps("Idle", th.TEXT_3, 7.8)
-        self.title = QLabel("No game detected")
-        self.title.setFont(th.font(20, QFont.DemiBold))
-        self.subtitle = QLabel("")
-        self.subtitle.setFont(th.font(9.4))
-        self.subtitle.setStyleSheet(f"color: {th.TEXT_2}; background: transparent;")
-        left.addWidget(self.mode_caps)
-        left.addWidget(self.title)
-        left.addWidget(self.subtitle)
-        top.addLayout(left, 1)
-
-        stats = QHBoxLayout()
-        stats.setSpacing(26)
-        self.game_stat = StatBlock("on game", th.AMBER_C)
-        self.test_stat = StatBlock("on tests", th.BLUE_C)
-        stats.addWidget(self.game_stat)
-        stats.addWidget(self.test_stat)
-        top.addLayout(stats)
-        root.addLayout(top)
-
-        self.strip = CpuStrip()
-        root.addWidget(self.strip)
-        root.addWidget(divider())
-
-        bottom = QHBoxLayout()
-        bottom.setSpacing(10)
-        self.auto_check = QCheckBox("Engage automatically when a game starts")
-        self.auto_check.setChecked(bool(config["auto_enable"]))
-        bottom.addWidget(self.auto_check)
-
-        bottom.addStretch(1)
-        bottom.addWidget(QLabel("using"))
-        self.auto_mode = QComboBox()
-        self.auto_mode.addItem("Hard split", "hard")
-        self.auto_mode.addItem("Smart split", "smart")
-        index = self.auto_mode.findData(config["auto_mode"])
-        self.auto_mode.setCurrentIndex(max(0, index))
-        self.auto_mode.setMinimumWidth(132)
-        bottom.addWidget(self.auto_mode)
-        root.addLayout(bottom)
-
-    def set_snapshot(self, snap, topo):
-        mode = snap["mode"]
-        game = snap.get("game")
-        title_text = {
-            "off": "Idle",
-            "smart": "Smart split",
-            "hard": "Hard split",
-        }.get(mode, "Idle")
-        caps_color = {"off": th.TEXT_3, "smart": th.BLUE_TEXT, "hard": th.AMBER_TEXT}.get(mode, th.TEXT_3)
-        state = "active" if game else "standby"
-        self.mode_caps.setText(f"{title_text} · {state}".upper())
-        self.mode_caps.setStyleSheet(f"color: {caps_color}; background: transparent;")
-
-        if game:
-            self.title.setText(game["name"])
-            self.subtitle.setText(f"pid {game['pid']}  ·  detected via {game['reason']}")
-        else:
-            self.title.setText("No game detected")
-            self.subtitle.setText(
-                "Everything shares all threads" if mode == "off"
-                else "Waiting for a game to start"
-            )
-
-        counts = snap["counts"]
-        self.game_stat.set_value(counts.get("game", 0))
-        self.test_stat.set_value(counts.get("test", 0))
-        self.strip.set_data(
-            topo.ccds, topo.siblings,
-            eng.parse_cpulist(snap["game_cpus"]),
-            eng.parse_cpulist(snap["test_cpus"]),
-        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 10, 0, 10)
+        layout.setSpacing(18)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setObjectName("SettingTitle")
+        text.addWidget(title_label)
+        if description:
+            desc_label = QLabel(description)
+            desc_label.setObjectName("SettingDesc")
+            desc_label.setWordWrap(True)
+            text.addWidget(desc_label)
+        layout.addLayout(text, 1)
+        if control is not None:
+            layout.addWidget(control, 0, Qt.AlignTop)
 
 
 # --------------------------------------------------------------------------- #
 # main window
 # --------------------------------------------------------------------------- #
+
+MODE_DESCRIPTIONS = {
+    "off": "Everything shares every core. Nothing is pinned.",
+    "smart": "Recognised test and agent processes are parked on the other side.",
+    "hard": "Everything except the game is parked on the other side.",
+}
+
 
 class MainWindow(QMainWindow):
     def __init__(self, engine, bridge, config):
@@ -599,8 +667,8 @@ class MainWindow(QMainWindow):
         self.bridge = bridge
         self.cfg = config
         self.setWindowTitle("CoreSplit")
-        self.resize(1140, 820)
-        self.setMinimumSize(980, 700)
+        self.resize(1000, 700)
+        self.setMinimumSize(880, 640)
 
         self._build()
         bridge.snapshot.connect(self._on_snapshot)
@@ -614,70 +682,151 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(30, 24, 30, 0)
-        outer.setSpacing(18)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         outer.addLayout(self._header())
-        self.card = StatusCard(self.cfg)
-        self.card.auto_check.toggled.connect(self._auto_toggled)
-        self.card.auto_mode.currentIndexChanged.connect(self._auto_mode_changed)
-        outer.addWidget(self.card)
 
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._overview_tab(), "Overview")
-        self.tabs.addTab(self._advanced_tab(), "Advanced")
-        outer.addWidget(self.tabs, 1)
-
-        bar = self.statusBar()
-        bar.setSizeGripEnabled(False)
-        self._status_label = QLabel("Starting…")
-        self._status_label.setObjectName("Status")
-        bar.addWidget(self._status_label, 1)
-        bar.setContentsMargins(30, 4, 30, 8)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._status_page())
+        self.stack.addWidget(self._processes_page())
+        self.stack.addWidget(self._settings_page())
+        outer.addWidget(self.stack, 1)
 
     def _header(self):
         row = QHBoxLayout()
-        row.setSpacing(20)
+        row.setContentsMargins(28, 18, 20, 14)
+        row.setSpacing(4)
 
-        left = QVBoxLayout()
-        left.setSpacing(1)
         wordmark = QLabel("CoreSplit")
-        wordmark.setFont(th.font(15.5, QFont.DemiBold, spacing=0.2))
-        tagline = QLabel("One CCD for the game, one for everything else")
-        tagline.setObjectName("Tagline")
-        left.addWidget(wordmark)
-        left.addWidget(tagline)
-        row.addLayout(left)
+        wordmark.setObjectName("Wordmark")
+        row.addWidget(wordmark)
         row.addStretch(1)
 
-        self.segments = SegmentedControl()
-        self.segments.changed.connect(self._user_set_mode)
-        row.addWidget(self.segments)
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        for index, name in enumerate(("Status", "Processes", "Settings")):
+            button = variant(QPushButton(name), "nav")
+            button.setCheckable(True)
+            button.setChecked(index == 0)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _=False, i=index: self.stack.setCurrentIndex(i))
+            self._nav_group.addButton(button, index)
+            row.addWidget(button)
         return row
 
-    def _card(self, title: str = ""):
-        card = QFrame()
-        card.setObjectName("Card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(22, 18, 22, 18)
-        layout.setSpacing(14)
-        if title:
-            layout.addWidget(caps(title))
-        return card, layout
+    # -- page 1: status ---------------------------------------------------- #
 
-    def _overview_tab(self):
+    def _status_page(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(40, 8, 40, 26)
+        outer.setSpacing(0)
+
+        column = QVBoxLayout()
+        column.setSpacing(0)
+
+        self.eyebrow = caps("Starting…", th.TEXT_3, 8.4)
+        self.eyebrow.setAlignment(Qt.AlignCenter)
+        column.addWidget(self.eyebrow)
+        column.addSpacing(10)
+
+        self.title = QLabel("CoreSplit")
+        self.title.setFont(th.font(27, QFont.DemiBold))
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setStyleSheet("background: transparent;")
+        column.addWidget(self.title)
+        column.addSpacing(8)
+
+        self.subtitle = QLabel("")
+        self.subtitle.setFont(th.font(9.6))
+        self.subtitle.setStyleSheet(f"color: {th.TEXT_2}; background: transparent;")
+        self.subtitle.setAlignment(Qt.AlignCenter)
+        self.subtitle.setWordWrap(True)
+        column.addWidget(self.subtitle)
+
+        column.addStretch(1)
+
+        stage_holder = QHBoxLayout()
+        stage_holder.addStretch(1)
+        self.stage = SplitStage()
+        stage_holder.addWidget(self.stage, 12)
+        stage_holder.addStretch(1)
+        column.addLayout(stage_holder)
+
+        column.addStretch(1)
+
+        selector_holder = QHBoxLayout()
+        selector_holder.addStretch(1)
+        self.segments = ModeSelector()
+        self.segments.changed.connect(self._user_set_mode)
+        selector_holder.addWidget(self.segments)
+        selector_holder.addStretch(1)
+        column.addLayout(selector_holder)
+        column.addSpacing(12)
+
+        self.mode_desc = QLabel(MODE_DESCRIPTIONS["off"])
+        self.mode_desc.setFont(th.font(9.2))
+        self.mode_desc.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+        self.mode_desc.setAlignment(Qt.AlignCenter)
+        column.addWidget(self.mode_desc)
+
+        column.addStretch(1)
+
+        auto_row = QHBoxLayout()
+        auto_row.addStretch(1)
+        auto_row.setSpacing(10)
+        self.auto_check = Switch()
+        self.auto_check.setChecked(bool(self.cfg["auto_enable"]))
+        auto_label = QLabel("Engage automatically when a game starts")
+        auto_label.setFont(th.font(9.4))
+        auto_label.setStyleSheet(f"color: {th.TEXT_2}; background: transparent;")
+        auto_row.addWidget(self.auto_check)
+        auto_row.addWidget(auto_label)
+
+        using = QLabel("using")
+        using.setFont(th.font(9.0))
+        using.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+        auto_row.addSpacing(6)
+        auto_row.addWidget(using)
+        self.auto_mode = QComboBox()
+        self.auto_mode.addItem("Hard split", "hard")
+        self.auto_mode.addItem("Smart split", "smart")
+        index = self.auto_mode.findData(self.cfg["auto_mode"])
+        self.auto_mode.setCurrentIndex(max(0, index))
+        self.auto_mode.setCursor(Qt.PointingHandCursor)
+        auto_row.addWidget(self.auto_mode)
+        auto_row.addStretch(1)
+        column.addLayout(auto_row)
+
+        column.addSpacing(14)
+
+        self.recent = QLabel("")
+        self.recent.setFont(th.font(8.4))
+        self.recent.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+        self.recent.setAlignment(Qt.AlignCenter)
+        column.addWidget(self.recent)
+
+        outer.addLayout(column, 1)
+
+        self.auto_check.toggled.connect(self._auto_toggled)
+        self.auto_mode.currentIndexChanged.connect(self._auto_mode_changed)
+        return page
+
+    # -- page 2: processes ------------------------------------------------- #
+
+    def _processes_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 14, 0, 0)
+        layout.setContentsMargins(28, 4, 28, 22)
         layout.setSpacing(12)
 
         toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        toolbar.setSpacing(12)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Search processes")
         self.filter.setClearButtonEnabled(True)
-        self.filter.setFixedWidth(260)
+        self.filter.setFixedWidth(250)
         self.filter.textChanged.connect(self._filter_changed)
         toolbar.addWidget(self.filter)
 
@@ -686,11 +835,19 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.show_all)
         toolbar.addStretch(1)
 
-        self._pin_game_btn = QPushButton("Pin to game")
+        self.proc_message = QLabel("")
+        self.proc_message.setFont(th.font(8.8))
+        self.proc_message.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+        toolbar.addWidget(self.proc_message)
+        self._proc_message_timer = QTimer(self)
+        self._proc_message_timer.setSingleShot(True)
+        self._proc_message_timer.timeout.connect(lambda: self.proc_message.setText(""))
+
+        self._pin_game_btn = variant(QPushButton("Pin to game"), "ghost")
         self._pin_game_btn.clicked.connect(lambda: self._pin_selected("game"))
         toolbar.addWidget(self._pin_game_btn)
 
-        self._pin_test_btn = QPushButton("Pin to tests")
+        self._pin_test_btn = variant(QPushButton("Pin to tests"), "ghost")
         self._pin_test_btn.clicked.connect(lambda: self._pin_selected("test"))
         toolbar.addWidget(self._pin_test_btn)
 
@@ -699,11 +856,6 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(release)
         layout.addLayout(toolbar)
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
-
-        table_card, table_layout = self._card()
-        table_layout.setContentsMargins(10, 8, 10, 10)
         self.model = ProcessModel()
         self.table = QTableView()
         self.table.setModel(self.model)
@@ -715,44 +867,43 @@ class MainWindow(QMainWindow):
         self.table.setWordWrap(False)
         self.table.setMouseTracking(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.verticalHeader().setDefaultSectionSize(46)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
         header.setHighlightSections(False)
-        header.setFixedHeight(36)
+        header.setFixedHeight(34)
         for index, width in enumerate(ProcessModel.WIDTHS):
             self.table.setColumnWidth(index, width)
-        table_layout.addWidget(self.table)
-        splitter.addWidget(table_card)
 
-        log_card, log_layout = self._card("Activity")
-        log_layout.setSpacing(8)
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setAcceptRichText(True)
-        self.log_view.setFont(th.font(8.8, mono=True))
-        self.log_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        log_layout.addWidget(self.log_view, 1)
-        splitter.addWidget(log_card)
+        # A soft empty state instead of a silent void.
+        table_holder = QWidget()
+        stack = QStackedLayout(table_holder)
+        stack.setStackingMode(QStackedLayout.StackAll)
+        stack.addWidget(self.table)
+        self.empty_hint = QLabel("No processes match")
+        self.empty_hint.setFont(th.font(9.4))
+        self.empty_hint.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.empty_hint.setVisible(False)
+        stack.addWidget(self.empty_hint)
+        stack.setCurrentWidget(self.table)
+        layout.addWidget(table_holder, 1)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setChildrenCollapsible(False)
-        table_card.setMinimumHeight(150)
-        log_card.setMinimumHeight(90)
-        log_card.setMaximumHeight(210)
-        splitter.setSizes([480, 150])
-        layout.addWidget(splitter, 1)
+        self.model.modelReset.connect(
+            lambda: self.empty_hint.setVisible(self.model.rowCount() == 0)
+        )
         return page
 
-    def _advanced_tab(self):
+    # -- page 3: settings -------------------------------------------------- #
+
+    def _settings_page(self):
         page = QWidget()
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 14, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -763,16 +914,18 @@ class MainWindow(QMainWindow):
         content = QWidget()
         content.setObjectName("ScrollContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 12, 14)
-        layout.setSpacing(14)
+        layout.setContentsMargins(40, 6, 40, 26)
+        layout.setSpacing(6)
 
-        split_card, split_layout = self._card("CPU split")
+        # -- the split ------------------------------------------------------ #
+        layout.addWidget(caps("The split", th.TEXT_3, 8.2))
+        layout.addSpacing(4)
+
         grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(7)
-
-        grid.addWidget(caps("Game CPUs", th.TEXT_2, 7.6), 0, 0)
-        grid.addWidget(caps("Test CPUs", th.TEXT_2, 7.6), 0, 1)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+        grid.addWidget(caps("Game keeps", th.TEXT_2, 7.6), 0, 0)
+        grid.addWidget(caps("Everything else gets", th.TEXT_2, 7.6), 0, 1)
         self.game_cpus = QLineEdit(self.cfg["game_cpus"])
         self.test_cpus = QLineEdit(self.cfg["test_cpus"])
         self.game_cpus.setPlaceholderText("e.g. 0-5,12-17")
@@ -781,87 +934,149 @@ class MainWindow(QMainWindow):
         self.test_cpus.textChanged.connect(self._update_split_hint)
         grid.addWidget(self.game_cpus, 1, 0)
         grid.addWidget(self.test_cpus, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
 
-        presets = QHBoxLayout()
-        presets.setSpacing(8)
+        presets_row = QHBoxLayout()
+        presets_row.setSpacing(8)
         for label, cores in (("Balanced 6/6", 6), ("Game-heavy 8/4", 8), ("Test-heavy 4/8", 4)):
             button = variant(QPushButton(label), "ghost")
+            button.setCursor(Qt.PointingHandCursor)
             button.clicked.connect(lambda _=False, c=cores: self._apply_preset(c))
-            presets.addWidget(button)
-        presets.addStretch(1)
-        grid.addLayout(presets, 2, 0, 1, 2)
+            presets_row.addWidget(button)
+        presets_row.addStretch(1)
+        apply_button = variant(QPushButton("Apply split"), "primary")
+        apply_button.setCursor(Qt.PointingHandCursor)
+        apply_button.clicked.connect(self._apply_split)
+        presets_row.addWidget(apply_button)
+        layout.addLayout(presets_row)
 
         self.split_hint = QLabel("")
         self.split_hint.setObjectName("Hint")
         self.split_hint.setWordWrap(True)
-        grid.addWidget(self.split_hint, 3, 0, 1, 2)
+        layout.addSpacing(2)
+        layout.addWidget(self.split_hint)
 
-        apply_row = QHBoxLayout()
-        apply_row.addStretch(1)
-        apply_button = variant(QPushButton("Apply split"), "primary")
-        apply_button.clicked.connect(self._apply_split)
-        apply_row.addWidget(apply_button)
-        grid.addLayout(apply_row, 4, 0, 1, 2)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        split_layout.addLayout(grid)
-        layout.addWidget(split_card)
+        layout.addSpacing(18)
+        layout.addWidget(divider())
+        layout.addSpacing(14)
 
-        options_card, options_layout = self._card("Behaviour")
-        self.renice_check = QCheckBox("Lower priority of test processes")
+        # -- behaviour ------------------------------------------------------ #
+        layout.addWidget(caps("Behaviour", th.TEXT_3, 8.2))
+        layout.addSpacing(4)
+
+        self.renice_check = Switch()
         self.renice_check.setChecked(bool(self.cfg["smart_renice"]))
         self.renice_check.toggled.connect(self._options_changed)
-        options_layout.addWidget(self.renice_check)
+        layout.addWidget(SettingRow(
+            "Lower priority of test processes",
+            "Reniced, so parked work never wins a scheduling fight with the game.",
+            self.renice_check))
 
-        self.ioprio_check = QCheckBox("Deprioritise test disk I/O")
+        self.ioprio_check = Switch()
         self.ioprio_check.setChecked(bool(self.cfg["smart_ioprio"]))
         self.ioprio_check.toggled.connect(self._options_changed)
-        options_layout.addWidget(self.ioprio_check)
+        layout.addWidget(SettingRow(
+            "Deprioritise test disk I/O",
+            "Parked processes wait behind the game for disk access too.",
+            self.ioprio_check))
 
-        self.autostart_check = QCheckBox("Start CoreSplit at login")
+        self.autostart_check = Switch()
         self.autostart_check.setChecked(bool(self.cfg["autostart"]))
         self.autostart_check.toggled.connect(self._autostart_toggled)
-        options_layout.addWidget(self.autostart_check)
+        layout.addWidget(SettingRow(
+            "Start CoreSplit at login",
+            "Hidden in the tray, ready before the first game launches.",
+            self.autostart_check))
 
-        self.guard_check = QCheckBox("Stop agents from taking focus while a game runs")
+        self.guard_check = Switch()
         self.guard_check.setChecked(bool(self.cfg["focus_guard"]))
         self.guard_check.toggled.connect(self._guard_toggled)
-        options_layout.addWidget(self.guard_check)
+        layout.addWidget(SettingRow(
+            "Focus guard",
+            "Agent windows are bounced before they can steal focus from a game. "
+            "Your own alt-tab still works.",
+            self.guard_check))
 
         self.guard_hint = QLabel("")
         self.guard_hint.setObjectName("Hint")
         self.guard_hint.setWordWrap(True)
-        options_layout.addWidget(self.guard_hint)
-        layout.addWidget(options_card)
+        left_indent = QHBoxLayout()
+        left_indent.addSpacing(0)
+        left_indent.addWidget(self.guard_hint, 1)
+        layout.addLayout(left_indent)
 
-        tools_card, tools_layout = self._card("Tools")
-        first = QHBoxLayout()
-        first.setSpacing(8)
-        steam_button = variant(QPushButton("Copy Steam launch option"), "ghost")
+        layout.addSpacing(14)
+        layout.addWidget(divider())
+        layout.addSpacing(14)
+
+        # -- tools ---------------------------------------------------------- #
+        layout.addWidget(caps("Tools", th.TEXT_3, 8.2))
+        layout.addSpacing(4)
+
+        steam_button = variant(QPushButton("Copy"), "ghost")
+        steam_button.setCursor(Qt.PointingHandCursor)
         steam_button.clicked.connect(self._copy_steam_option)
-        first.addWidget(steam_button)
-        wrapper_button = variant(QPushButton("Install testcpus wrapper"), "ghost")
-        wrapper_button.clicked.connect(self._install_wrapper)
-        first.addWidget(wrapper_button)
-        first.addStretch(1)
-        tools_layout.addLayout(first)
+        layout.addWidget(SettingRow(
+            "Steam launch option",
+            "The exact taskset line for this split, ready to paste into a game's "
+            "launch options.",
+            steam_button))
 
-        second = QHBoxLayout()
-        second.setSpacing(8)
-        load_button = variant(QPushButton("Run 10 s test load"), "ghost")
+        wrapper_button = variant(QPushButton("Install"), "ghost")
+        wrapper_button.setCursor(Qt.PointingHandCursor)
+        wrapper_button.clicked.connect(self._install_wrapper)
+        layout.addWidget(SettingRow(
+            "testcpus wrapper",
+            "Run a one-off command on the test side from any shell: "
+            "testcpus cargo test",
+            wrapper_button))
+
+        load_button = variant(QPushButton("Run"), "ghost")
+        load_button.setCursor(Qt.PointingHandCursor)
         load_button.clicked.connect(self._run_test_load)
-        second.addWidget(load_button)
-        reset_button = variant(QPushButton("Reset all pins"), "danger")
+        layout.addWidget(SettingRow(
+            "Test load",
+            "Ten seconds of load on the test side. Watch the game's frame time "
+            "stay flat — that is the split working.",
+            load_button))
+
+        reset_button = variant(QPushButton("Release all"), "danger")
+        reset_button.setCursor(Qt.PointingHandCursor)
         reset_button.clicked.connect(self._reset_all)
-        second.addWidget(reset_button)
-        second.addStretch(1)
-        tools_layout.addLayout(second)
+        layout.addWidget(SettingRow(
+            "Release all pins",
+            "Unpin every process, even if the app was killed uncleanly.",
+            reset_button))
 
         self.tools_hint = QLabel("")
         self.tools_hint.setObjectName("Hint")
         self.tools_hint.setWordWrap(True)
-        tools_layout.addWidget(self.tools_hint)
-        layout.addWidget(tools_card)
+        layout.addSpacing(2)
+        layout.addWidget(self.tools_hint)
+
+        layout.addSpacing(18)
+        layout.addWidget(divider())
+        layout.addSpacing(14)
+
+        # -- activity ------------------------------------------------------- #
+        layout.addWidget(caps("Activity", th.TEXT_3, 8.2))
+        layout.addSpacing(8)
+        log_panel = QFrame()
+        log_panel.setStyleSheet(
+            f"background: {th.SURFACE}; border: 1px solid {th.LINE_SOFT}; border-radius: 14px;")
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(14, 10, 14, 10)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setAcceptRichText(True)
+        self.log_view.setFont(th.font(8.6, mono=True))
+        self.log_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.log_view.setFixedHeight(170)
+        log_layout.addWidget(self.log_view)
+        layout.addWidget(log_panel)
+
         layout.addStretch(1)
 
         scroll.setWidget(content)
@@ -871,29 +1086,65 @@ class MainWindow(QMainWindow):
     # -- engine -> ui ------------------------------------------------------ #
 
     def _on_snapshot(self, snap):
-        self.segments.set_mode(snap["mode"])
-        self.card.set_snapshot(snap, self.engine.topo)
+        mode = snap["mode"]
+        self.segments.set_mode(mode)
+        self.stage.set_data(
+            self.engine.topo, snap["game_cpus"], snap["test_cpus"],
+            active=mode in ("smart", "hard"),
+        )
+        self._update_status_text(snap)
         self.model.set_rows(snap["procs"])
         self._update_split_hint()
-
-        counts = snap["counts"]
-        self._status_label.setText(
-            f"{len(snap['procs'])} processes  ·  {counts.get('pinned', 0)} pinned  ·  "
-            f"game {snap['game_cpus']}  ·  tests {snap['test_cpus']}"
-        )
-        self.setWindowIcon(th.make_icon(snap["mode"]))
+        self.setWindowIcon(th.make_icon(mode))
 
         if self.log_view.document().isEmpty() and snap["logs"]:
             for line in snap["logs"]:
                 self._append_log(line)
 
+    def _update_status_text(self, snap):
+        mode = snap["mode"]
+        game = snap.get("game")
+        counts = snap["counts"]
+
+        if mode == "off":
+            self.eyebrow.setText("OFF · EVERYTHING SHARED")
+            self.eyebrow.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+            self.title.setText("Nothing is pinned")
+            self.subtitle.setText(
+                f"All {self.engine.topo.core_count(self.engine.topo.all_cpus)} physical cores "
+                "serve whatever you run.")
+        else:
+            word = "HARD SPLIT" if mode == "hard" else "SMART SPLIT"
+            accent = th.AMBER_TEXT if mode == "hard" else th.BLUE_TEXT
+            if game:
+                self.eyebrow.setText(f"{word} · PROTECTING")
+                self.eyebrow.setStyleSheet(f"color: {accent}; background: transparent;")
+                self.title.setText(game["name"])
+                n = counts.get("game", 0)
+                self.subtitle.setText(
+                    f"{n} process{'es' if n != 1 else ''} on the game side · "
+                    f"detected via {game['reason']}")
+            else:
+                self.eyebrow.setText(f"{word} · STANDBY")
+                self.eyebrow.setStyleSheet(f"color: {accent}; background: transparent;")
+                self.title.setText("Waiting for a game")
+                if snap.get("auto"):
+                    self.subtitle.setText("The split engages the moment a game starts.")
+                else:
+                    self.subtitle.setText("Start a game and CoreSplit will follow.")
+
+        self.mode_desc.setText(MODE_DESCRIPTIONS.get(mode, MODE_DESCRIPTIONS["off"]))
+
     def _append_log(self, line):
         match = re.match(r"^\[(\d\d:\d\d:\d\d)\]\s*(.*)$", line)
         if match:
-            body = (f'<span style="color:{th.TEXT_3}">{match.group(1)}</span>'
-                    f'&nbsp;&nbsp;<span style="color:{th.TEXT_2}">{html.escape(match.group(2))}</span>')
+            stamp, body_text = match.group(1), match.group(2)
+            body = (f'<span style="color:{th.TEXT_3}">{stamp}</span>'
+                    f'&nbsp;&nbsp;<span style="color:{th.TEXT_2}">{html.escape(body_text)}</span>')
+            self.recent.setText(f"{stamp}  ·  {body_text}")
         else:
             body = f'<span style="color:{th.TEXT_2}">{html.escape(line)}</span>'
+            self.recent.setText(line)
         self.log_view.append(body)
 
     # -- user actions ------------------------------------------------------ #
@@ -906,7 +1157,7 @@ class MainWindow(QMainWindow):
         self.cfg.save()
 
     def _auto_mode_changed(self):
-        self.cfg["auto_mode"] = self.card.auto_mode.currentData()
+        self.cfg["auto_mode"] = self.auto_mode.currentData()
         self.cfg.save()
 
     def _options_changed(self):
@@ -934,20 +1185,17 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "guard_hint"):
             return
         if not self.cfg["focus_guard"]:
-            self.guard_hint.setText("Agent windows may take focus from the game.")
+            self.guard_hint.setText("Off — agent windows may take focus from the game.")
             self.guard_hint.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
             return
         if getattr(self, "_guard_ready", False):
             self.guard_hint.setText(
-                "Agent windows are blocked from taking focus while a game is protected. "
-                "Your own window switches still work."
-            )
+                "On — agent windows are bounced while a game is protected.")
             self.guard_hint.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
         else:
             self.guard_hint.setText(
                 "The KWin script is installed but CoreSplit's focus service is not "
-                "reachable, so the guard is inactive."
-            )
+                "reachable, so the guard is inactive.")
             self.guard_hint.setStyleSheet(f"color: {th.AMBER_TEXT}; background: transparent;")
 
     def _autostart_toggled(self, checked):
@@ -971,6 +1219,10 @@ class MainWindow(QMainWindow):
     def _show_all_toggled(self, checked):
         self.model.set_show_all(checked)
 
+    def _flash(self, text):
+        self.proc_message.setText(text)
+        self._proc_message_timer.start(5000)
+
     def _selected_pids(self):
         rows = {index.row() for index in self.table.selectionModel().selectedRows()}
         return [pid for pid in (self.model.pid_at(row) for row in rows) if pid]
@@ -978,18 +1230,18 @@ class MainWindow(QMainWindow):
     def _pin_selected(self, role):
         pids = self._selected_pids()
         if not pids:
-            self._status_label.setText("Select one or more processes first")
+            self._flash("Select one or more processes first")
             return
         self.engine.request("manual_pin", pids=pids, role=role)
-        self._status_label.setText(f"Pinned {len(pids)} process(es) to the {role} CCD")
+        self._flash(f"Pinned {len(pids)} to the {role} side")
 
     def _release_selected(self):
         pids = self._selected_pids()
         if not pids:
-            self._status_label.setText("Select one or more processes first")
+            self._flash("Select one or more processes first")
             return
         self.engine.request("manual_release", pids=pids)
-        self._status_label.setText(f"Released {len(pids)} process(es)")
+        self._flash(f"Released {len(pids)} process(es)")
 
     def _apply_preset(self, game_cores):
         game, test = self.engine.topo.split_by_core_count(game_cores)
@@ -1057,7 +1309,7 @@ class MainWindow(QMainWindow):
         self.tools_hint.setText(f"Wrapper written to {path}")
 
     def _run_test_load(self):
-        self.tools_hint.setText("Running 10 s of load on the test CCD…")
+        self.tools_hint.setText("Running 10 s of load on the test side…")
         QApplication.setOverrideCursor(Qt.BusyCursor)
         try:
             count = eng.run_test_load(self.cfg, self.engine.topo, 10)
@@ -1119,7 +1371,7 @@ class TrayController(QObject):
         show = QAction("Show window", menu)
         show.triggered.connect(self._show)
         menu.addAction(show)
-        reset = QAction("Reset all pins", menu)
+        reset = QAction("Release all pins", menu)
         reset.triggered.connect(lambda: self.engine.request("reset"))
         menu.addAction(reset)
         menu.addSeparator()

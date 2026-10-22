@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """CoreSplit visual system: palette, typography, stylesheet and icon painting.
 
-The look is a quiet dark "ink and amber" scheme: near-black surfaces, one warm
-accent for the game and one cool accent for background work. Nothing saturated
-or glowing; the colour is only used where it carries meaning.
+The look is a warm dark "ink and amber" scheme with very few moving parts:
+near-black surfaces, one warm accent for the game, one cool accent for
+everything else. Colour appears only where it carries meaning; everything
+else is typography and space.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from string import Template
 
-from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtCore import QRectF, Qt
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
@@ -20,29 +21,29 @@ DOT_SVG = ASSET_DIR / "dot.svg"
 
 # -- palette ---------------------------------------------------------------- #
 
-INK = "#0e1014"
-SURFACE = "#15181e"
-SURFACE_2 = "#1a1e26"
-SURFACE_3 = "#20252e"
-LINE = "#262c37"
-LINE_SOFT = "#1e232c"
+INK = "#0f1115"
+SURFACE = "#161921"
+SURFACE_2 = "#1b1f28"
+SURFACE_3 = "#222834"
+LINE = "#293039"
+LINE_SOFT = "#1f2530"
 
-TEXT = "#e9ecf1"
-TEXT_2 = "#9aa3b2"
-TEXT_3 = "#6b7484"
+TEXT = "#eceef3"
+TEXT_2 = "#a3abbc"
+TEXT_3 = "#6e7889"
 
-AMBER = "#dda85e"
-AMBER_DIM = "#8a6a3f"
-AMBER_TEXT = "#eec38a"
+AMBER = "#e0a35e"
+AMBER_DIM = "#8f6e41"
+AMBER_TEXT = "#f0c795"
 
-BLUE = "#6f92c9"
-BLUE_DIM = "#44587a"
-BLUE_TEXT = "#a6bcdf"
+BLUE = "#7d9ccb"
+BLUE_DIM = "#4d6288"
+BLUE_TEXT = "#adc2e3"
 
-GRAY = "#4b5464"
-GRAY_TEXT = "#8b94a4"
+GRAY = "#505a6b"
+GRAY_TEXT = "#8d97a8"
 
-DANGER = "#d97a7a"
+DANGER = "#d98080"
 
 SANS = "Noto Sans"
 MONO = "DejaVu Sans Mono"
@@ -64,6 +65,7 @@ TEXT_2_C = q(TEXT_2)
 TEXT_3_C = q(TEXT_3)
 INK_C = q(INK)
 SURFACE_C = q(SURFACE)
+SURFACE_2_C = q(SURFACE_2)
 LINE_C = q(LINE)
 
 
@@ -71,6 +73,17 @@ def tint(color: QColor, alpha: int) -> QColor:
     out = QColor(color)
     out.setAlpha(alpha)
     return out
+
+
+def mix(a: QColor, b: QColor, t: float) -> QColor:
+    """Linear blend between two colours; t=0 gives a, t=1 gives b."""
+    t = max(0.0, min(1.0, t))
+    return QColor(
+        round(a.red() + (b.red() - a.red()) * t),
+        round(a.green() + (b.green() - a.green()) * t),
+        round(a.blue() + (b.blue() - a.blue()) * t),
+        round(a.alpha() + (b.alpha() - a.alpha()) * t),
+    )
 
 
 ROLE_ACCENT = {"game": AMBER_C, "test": BLUE_C, "other": GRAY_C}
@@ -102,54 +115,50 @@ QWidget#ScrollContent, QWidget#ScrollViewport { background: transparent; }
 QScrollArea { background: transparent; border: none; }
 
 QLabel { background: transparent; }
+QLabel#Wordmark { font-size: 13pt; font-weight: 600; letter-spacing: 0.4px; }
 QLabel#Tagline { color: $TEXT_3; font-size: 9pt; }
-QLabel#Hint { color: $TEXT_3; font-size: 9pt; }
-QLabel#CardTitle { font-size: 11pt; font-weight: 600; }
-QLabel#Status { color: $TEXT_3; font-size: 9pt; }
-QLabel#ChipGame { background: rgba(221,168,94,0.13); color: $AMBER_TEXT; border-radius: 10px; padding: 3px 10px; font-size: 8.5pt; font-weight: 600; }
-QLabel#ChipTest { background: rgba(111,146,201,0.14); color: $BLUE_TEXT; border-radius: 10px; padding: 3px 10px; font-size: 8.5pt; font-weight: 600; }
+QLabel#Hint { color: $TEXT_3; font-size: 8.8pt; }
+QLabel#SettingTitle { font-size: 10pt; font-weight: 600; }
+QLabel#SettingDesc { color: $TEXT_3; font-size: 8.8pt; }
+QLabel#SectionCaps { color: $TEXT_3; font-size: 8.2pt; font-weight: 600; letter-spacing: 1.4px; }
 
-QFrame#Card { background: $SURFACE; border: 1px solid $LINE_SOFT; border-radius: 16px; }
 QFrame#Divider { background: $LINE_SOFT; border: none; min-height: 1px; max-height: 1px; }
 
-QPushButton { background: $SURFACE_2; color: $TEXT; border: 1px solid $LINE; border-radius: 9px; padding: 8px 15px; font-size: 9.5pt; }
-QPushButton:hover { background: $SURFACE_3; border-color: #333b48; }
+QPushButton { background: $SURFACE_2; color: $TEXT; border: 1px solid $LINE; border-radius: 10px; padding: 8px 16px; font-size: 9.5pt; }
+QPushButton:hover { background: $SURFACE_3; border-color: #343d4a; }
 QPushButton:pressed { background: $SURFACE; }
 QPushButton:disabled { color: $TEXT_3; }
-QPushButton[variant="primary"] { background: $AMBER; color: #191307; border: none; font-weight: 600; }
-QPushButton[variant="primary"]:hover { background: #e8b979; }
+QPushButton[variant="primary"] { background: $AMBER; color: #1a1206; border: none; font-weight: 600; }
+QPushButton[variant="primary"]:hover { background: #e9b473; }
 QPushButton[variant="ghost"] { background: transparent; color: $TEXT_2; border: 1px solid $LINE; }
 QPushButton[variant="ghost"]:hover { background: $SURFACE_2; color: $TEXT; }
-QPushButton[variant="danger"] { background: transparent; border: 1px solid #3d2a2c; color: $DANGER; }
+QPushButton[variant="danger"] { background: transparent; border: 1px solid #3d2b2d; color: $DANGER; }
 QPushButton[variant="danger"]:hover { background: #241a1c; }
+QPushButton[variant="nav"] { background: transparent; border: none; border-radius: 9px; color: $TEXT_3; padding: 7px 14px; font-size: 9.5pt; font-weight: 600; }
+QPushButton[variant="nav"]:hover { color: $TEXT_2; }
+QPushButton[variant="nav"]:checked { background: $SURFACE_2; color: $TEXT; }
 
-QLineEdit { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 9px; padding: 8px 12px; selection-background-color: $AMBER; selection-color: #191307; }
+QLineEdit { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 10px; padding: 8px 12px; selection-background-color: $AMBER; selection-color: #1a1206; }
 QLineEdit:focus { border-color: $AMBER_DIM; background: $SURFACE_3; }
 QLineEdit::placeholder { color: $TEXT_3; }
 
-QComboBox { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 9px; padding: 7px 12px; color: $TEXT; }
-QComboBox:hover { border-color: #333b48; }
-QComboBox::drop-down { border: none; width: 24px; }
+QComboBox { background: transparent; border: 1px solid $LINE; border-radius: 9px; padding: 5px 12px; color: $TEXT_2; }
+QComboBox:hover { color: $TEXT; border-color: #343d4a; }
+QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow { image: none; }
-QComboBox QAbstractItemView { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 8px; padding: 4px; outline: none; selection-background-color: $SURFACE_3; selection-color: $TEXT; }
+QComboBox QAbstractItemView { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 10px; padding: 4px; outline: none; selection-background-color: $SURFACE_3; selection-color: $TEXT; }
 
-QCheckBox { color: $TEXT_2; font-size: 9.5pt; spacing: 9px; background: transparent; }
+QCheckBox { color: $TEXT_2; font-size: 9.3pt; spacing: 9px; background: transparent; }
 QCheckBox::indicator { width: 17px; height: 17px; border-radius: 5px; border: 1px solid $LINE; background: $SURFACE_2; }
 QCheckBox::indicator:hover { border-color: $AMBER_DIM; }
 QCheckBox::indicator:checked { background: $AMBER; border-color: $AMBER; image: url($CHECK); }
 
-QTabWidget::pane { border: none; background: transparent; }
-QTabBar { background: transparent; }
-QTabBar::tab { background: transparent; color: $TEXT_3; padding: 10px 2px; margin-right: 30px; border: none; border-bottom: 2px solid transparent; font-size: 9.5pt; font-weight: 600; }
-QTabBar::tab:hover:!selected { color: $TEXT_2; }
-QTabBar::tab:selected { color: $TEXT; border-bottom: 2px solid $AMBER; }
-
 QTableView { background: transparent; border: none; gridline-color: transparent; selection-background-color: transparent; alternate-background-color: transparent; outline: none; }
 QHeaderView { background: transparent; }
-QHeaderView::section { background: transparent; color: $TEXT_3; border: none; border-bottom: 1px solid $LINE; padding: 9px 12px; font-size: 8.2pt; font-weight: 600; }
+QHeaderView::section { background: transparent; color: $TEXT_3; border: none; border-bottom: 1px solid $LINE_SOFT; padding: 8px 12px; font-size: 8.2pt; font-weight: 600; letter-spacing: 0.8px; }
 QTableCornerButton::section { background: transparent; border: none; }
 
-QTextEdit, QPlainTextEdit { background: transparent; border: none; color: $TEXT_2; selection-background-color: rgba(221,168,94,0.22); }
+QTextEdit, QPlainTextEdit { background: transparent; border: none; color: $TEXT_2; selection-background-color: rgba(224,163,94,0.22); }
 
 QScrollBar:vertical { background: transparent; width: 9px; margin: 2px 0; }
 QScrollBar::handle:vertical { background: #333a46; border-radius: 4px; min-height: 32px; }
@@ -161,20 +170,14 @@ QScrollBar::handle:horizontal { background: #333a46; border-radius: 4px; min-wid
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; border: none; background: none; }
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
 
-QSplitter::handle { background: transparent; height: 14px; }
-QSplitter::handle:hover { background: $LINE_SOFT; }
-
-QStatusBar { background: transparent; border-top: 1px solid $LINE_SOFT; color: $TEXT_3; }
-QStatusBar::item { border: none; }
-
-QMenu { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 10px; padding: 6px; }
-QMenu::item { padding: 8px 30px 8px 12px; border-radius: 7px; color: $TEXT; font-size: 9.5pt; }
+QMenu { background: $SURFACE_2; border: 1px solid $LINE; border-radius: 12px; padding: 6px; }
+QMenu::item { padding: 8px 30px 8px 12px; border-radius: 8px; color: $TEXT; font-size: 9.5pt; }
 QMenu::item:selected { background: $SURFACE_3; }
 QMenu::separator { height: 1px; background: $LINE; margin: 6px 8px; }
 QMenu::indicator { width: 15px; height: 15px; }
 QMenu::indicator:checked { image: url($DOT); }
 
-QToolTip { background: $SURFACE_3; color: $TEXT; border: 1px solid $LINE; border-radius: 7px; padding: 6px 9px; }
+QToolTip { background: $SURFACE_3; color: $TEXT; border: 1px solid $LINE; border-radius: 8px; padding: 6px 9px; }
 """)
 
 
@@ -205,13 +208,13 @@ def _icon_pixmap(mode: str, size: int) -> QPixmap:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing, True)
 
-    pad = size * 0.09
+    pad = size * 0.10
     rect = QRectF(pad, pad, size - 2 * pad, size - 2 * pad)
-    radius = size * 0.26
-    gap = max(1.0, size * 0.03)
+    radius = size * 0.28
+    gap = max(1.0, size * 0.045)
 
-    left = AMBER_C if mode != "off" else GRAY_C
-    right = BLUE_C if mode != "off" else GRAY_C
+    left = AMBER_C if mode != "off" else q("#5b6474")
+    right = BLUE_C if mode != "off" else q("#4a5261")
 
     clip = QPainterPath()
     clip.addRoundedRect(rect, radius, radius)
@@ -222,16 +225,11 @@ def _icon_pixmap(mode: str, size: int) -> QPixmap:
     painter.setBrush(right)
     painter.drawRect(QRectF(rect.center().x() + gap / 2, rect.top(),
                             rect.width() / 2 - gap / 2, rect.height()))
-
-    sheen = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-    sheen.setColorAt(0.0, QColor(255, 255, 255, 46))
-    sheen.setColorAt(0.45, QColor(255, 255, 255, 0))
-    painter.fillRect(rect, sheen)
     painter.setClipping(False)
 
     if mode == "hard":
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(255, 255, 255, 190), max(1.0, size * 0.025)))
+        painter.setPen(QPen(QColor(255, 255, 255, 170), max(1.0, size * 0.028)))
         painter.drawRoundedRect(rect.adjusted(0.6, 0.6, -0.6, -0.6), radius, radius)
 
     painter.end()
