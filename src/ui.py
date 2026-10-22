@@ -436,19 +436,28 @@ class SplitStage(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._game_cores: list[list[int]] = []
         self._other_cores: list[list[int]] = []
+        self._from_game: list[list[int]] = []   # layout the morph animates away from
+        self._from_other: list[list[int]] = []
         self._game_range = ""
         self._other_range = ""
         self._all_range = ""
         self._total = 0
         self._pos = 0.0
         self._target = 0.0
-        self._warning = False
+        self._warning_game = False
+        self._warning_test = False
         self._samples = deque()  # (monotonic_ts, game_pct, test_pct)
-        self._delay = 1.5        # render delay: one poll, so curves never jump
+        self._gaps = deque()     # recent poll gaps; their median sets the delay
+        self._delay = 3.0        # curves are drawn this many seconds behind now
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(420)
         self._anim.setEasingCurve(QEasingCurve.InOutCubic)
         self._anim.valueChanged.connect(self._on_anim)
+        self._morph = QVariantAnimation(self)
+        self._morph.setDuration(520)
+        self._morph.setEasingCurve(QEasingCurve.InOutCubic)
+        self._morph.valueChanged.connect(self._on_morph)
+        self._morph_t = 1.0
         self._scroll = QTimer(self)
         self._scroll.setInterval(33)
         self._scroll.timeout.connect(self.update)
@@ -457,8 +466,14 @@ class SplitStage(QWidget):
         now = time.monotonic()
         if self._samples:
             gap = now - self._samples[-1][0]
-            if 0.2 < gap < 6.0:
-                self._delay = gap
+            if 0.2 < gap < 20.0:
+                self._gaps.append(gap)
+                if len(self._gaps) > 8:
+                    self._gaps.popleft()
+                median = sorted(self._gaps)[len(self._gaps) // 2]
+                # Draw well behind the newest sample so every new point is
+                # interpolated into view instead of popping in at the edge.
+                self._delay = max(2.5, min(10.0, median * 1.6))
         self._samples.append((now,
                               max(0.0, min(100.0, game_pct)),
                               max(0.0, min(100.0, test_pct))))
@@ -477,16 +492,32 @@ class SplitStage(QWidget):
         self._scroll.stop()
         super().hideEvent(event)
 
-    def set_data(self, topo, game_cpus, test_cpus, active: bool, warning: bool = False):
+    def set_data(self, topo, game_cpus, test_cpus, active: bool,
+                 warning_game: bool = False, warning_test: bool = False):
         game = eng.parse_cpulist(game_cpus)
         test = eng.parse_cpulist(test_cpus)
-        self._game_cores = [core for core in topo.physical_cores() if set(core) & game]
-        self._other_cores = [core for core in topo.physical_cores() if core not in self._game_cores]
-        self._total = len(self._game_cores) + len(self._other_cores)
+        new_game = [core for core in topo.physical_cores() if set(core) & game]
+        new_other = [core for core in topo.physical_cores() if core not in new_game]
         self._game_range = fmt_range(eng.format_cpulist(sorted(game)))
         self._other_range = fmt_range(eng.format_cpulist(sorted(test)))
         self._all_range = fmt_range(eng.format_cpulist(topo.all_cpus))
-        self._warning = bool(warning)
+        self._warning_game = bool(warning_game)
+        self._warning_test = bool(warning_test)
+        old_game, old_other = self._game_cores, self._other_cores
+        moved = bool(old_game) and (len(old_game) != len(new_game) or old_game != new_game)
+        self._game_cores, self._other_cores = new_game, new_other
+        self._total = len(new_game) + len(new_other)
+        if moved:
+            # Both partitions list the cores in physical order, so index i is
+            # the same core on both sides and the dots can morph across.
+            self._from_game, self._from_other = old_game, old_other
+            self._morph.stop()
+            self._morph.setStartValue(0.0)
+            self._morph.setEndValue(1.0)
+            if self.isVisible():
+                self._morph.start()
+            else:
+                self._morph_t = 1.0
         target = 1.0 if active else 0.0
         if target != self._target:
             self._target = target
@@ -503,6 +534,25 @@ class SplitStage(QWidget):
         self._pos = float(value)
         self.update()
 
+    def _on_morph(self, value):
+        self._morph_t = float(value)
+        if self._morph_t >= 1.0:
+            self._from_game, self._from_other = [], []
+        self.update()
+
+    @staticmethod
+    def _panel_pad(rect: QRectF) -> float:
+        return 24.0 if rect.width() >= 260 else 16.0
+
+    @staticmethod
+    def _dot_metrics(inner_w: float, n: int):
+        """Dot diameter and spacing that keep n dots inside inner_w."""
+        gap = 9.0
+        dot = max(4.0, min(13.0, (inner_w - gap * (n - 1)) / n))
+        if dot * n + gap * (n - 1) > inner_w > 0:
+            gap = max(2.0, (inner_w - dot * n) / max(1, n - 1))
+        return dot, gap
+
     # -- painting ---------------------------------------------------------- #
 
     def paintEvent(self, event):
@@ -514,6 +564,8 @@ class SplitStage(QWidget):
             return
 
         p = self._pos
+        t = self._morph_t
+        morphing = t < 1.0 and bool(self._from_game)
         width = self.width()
         height = float(self.HEIGHT)
         radius = 24.0
@@ -525,77 +577,153 @@ class SplitStage(QWidget):
         shared_fill = th.q(th.SURFACE)
         shared_border = th.LINE_C
 
+        n_to = max(1, len(self._game_cores))
+        o_to = max(1, len(self._other_cores))
+        if morphing:
+            n_from = max(1, len(self._from_game))
+        else:
+            n_from = n_to
+        # The panel widths, numerals and dot positions all ride this float, so
+        # a balance change reads as one continuous reshuffle.
+        n_float = n_from + (n_to - n_from) * t
+        game_num = max(1, round(n_float))
+        other_num = max(1, self._total - game_num)
+
         if p < 0.995:
-            # Shared state: a single quiet panel holding every core.
+            # Shared state: a single quiet panel. The dots carry the balance
+            # preset, so moving the slider stays visible while mode is off.
             alpha = 1.0 - p
             rect = QRectF(0, 0, width, height)
+            base = th.q("#5b6474")
+            game_c = th.mix(base, th.AMBER_C, 0.6)
+            test_c = th.mix(base, th.BLUE_C, 0.6)
+            colors = [
+                th.mix(game_c if i < n_from else test_c,
+                       game_c if i < n_to else test_c, t)
+                for i in range(self._total)
+            ]
             self._panel(
                 painter, rect, radius, shared_fill, shared_border,
                 label="All cores shared", label_alpha=alpha * 0.9,
                 count_n=f"{self._total}", count_word="cores", count_alpha=alpha,
                 sub=self._all_range, sub_alpha=alpha * 0.8,
                 cores=self._game_cores + self._other_cores,
-                dot_color=th.q("#5b6474"), label_color=th.TEXT_3_C,
+                dot_colors=colors, label_color=th.TEXT_3_C,
             )
 
         if p > 0.005:
             gap = 34.0 * p
-            game_n = max(1, len(self._game_cores))
-            other_n = max(1, len(self._other_cores))
             usable = width - gap
-            game_w = usable * game_n / self._total
+            game_w = usable * n_float / self._total
             game_rect = QRectF(0, 0, game_w, height)
             other_rect = QRectF(game_w + gap, 0, usable - game_w, height)
             fade = max(0.0, (p - 0.25) / 0.75)  # text arrives as the gap opens
+            game_dot = th.mix(th.q("#5b6474"), th.AMBER_C, p)
+            other_dot = th.mix(th.q("#5b6474"), th.BLUE_C, p)
+
+            dot_layer = None
+            if morphing:
+                dot_layer = self._morph_dots(game_rect, other_rect, n_from, n_to,
+                                             game_dot, other_dot, t, height)
 
             self._panel(
                 painter, game_rect, radius, game_fill, game_border,
                 label="Game", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.AMBER_TEXT), p),
-                count_n=f"{game_n}", count_word="core" if game_n == 1 else "cores",
+                count_n=f"{game_num}", count_word="core" if game_num == 1 else "cores",
                 count_alpha=fade,
                 sub=self._game_range, sub_alpha=fade * 0.85,
                 cores=self._game_cores,
-                dot_color=th.mix(th.q("#5b6474"), th.AMBER_C, p),
-                warning=self._warning,
+                dot_color=game_dot,
+                draw_dots=not morphing,
+                warning=self._warning_game,
                 samples=self._samples, delay=self._delay, series=0, accent=th.AMBER_C,
             )
             self._panel(
                 painter, other_rect, radius, other_fill, other_border,
                 label="Everything else", label_alpha=fade, label_color=th.mix(th.TEXT_3_C, th.q(th.BLUE_TEXT), p),
-                count_n=f"{other_n}", count_word="core" if other_n == 1 else "cores",
+                short_label="Other",
+                count_n=f"{other_num}", count_word="core" if other_num == 1 else "cores",
                 count_alpha=fade,
                 sub=self._other_range, sub_alpha=fade * 0.85,
                 cores=self._other_cores,
-                dot_color=th.mix(th.q("#5b6474"), th.BLUE_C, p),
+                dot_color=other_dot,
+                draw_dots=not morphing,
+                warning=self._warning_test,
                 samples=self._samples, delay=self._delay, series=1, accent=th.BLUE_C,
             )
+            if dot_layer:
+                painter.setPen(Qt.NoPen)
+                for center, color, dsz in dot_layer:
+                    painter.setBrush(color)
+                    painter.drawEllipse(center, dsz / 2, dsz / 2)
         painter.end()
+
+    def _morph_dots(self, game_rect, other_rect, n_from, n_to, game_dot, other_dot, t, height):
+        """Dot layer for a balance change: every dot slides from its old slot
+        to its new one, recolouring as it crosses the divide."""
+        pad_g = self._panel_pad(game_rect)
+        pad_o = self._panel_pad(other_rect)
+        inner_g = game_rect.width() - pad_g * 2
+        inner_o = other_rect.width() - pad_o * 2
+        dot_g, gap_g = self._dot_metrics(inner_g, n_to)
+        dot_o, gap_o = self._dot_metrics(inner_o, self._total - n_to)
+        cy = height - 24.0
+        layer = []
+
+        def slot_x(rect, pad, dot, gap, slot):
+            return rect.left() + pad + slot * (dot + gap) + dot / 2
+
+        for i in range(self._total):
+            if i < n_from:
+                fx, c0 = slot_x(game_rect, pad_g, dot_g, gap_g, i), game_dot
+            else:
+                fx, c0 = slot_x(other_rect, pad_o, dot_o, gap_o, i - n_from), other_dot
+            if i < n_to:
+                tx, c1 = slot_x(game_rect, pad_g, dot_g, gap_g, i), game_dot
+            else:
+                tx, c1 = slot_x(other_rect, pad_o, dot_o, gap_o, i - n_to), other_dot
+            color = th.mix(c0, c1, t)
+            layer.append((QPointF(fx + (tx - fx) * t, cy), color, dot_g if i < n_to else dot_o))
+        return layer
 
     def _panel(self, painter, rect: QRectF, radius, fill, border, *, label, label_alpha,
                label_color=None, count_n, count_word, count_alpha, sub, sub_alpha, cores,
-               dot_color, warning=False, samples=None, delay=1.5, series=0, accent=None):
+               dot_color=None, dot_colors=None, draw_dots=True, short_label="",
+               warning=False, samples=None, delay=2.5, series=0, accent=None):
         painter.setPen(QPen(border, 1))
         painter.setBrush(fill)
         painter.drawRoundedRect(rect, radius, radius)
 
-        pad = 24.0
+        pad = self._panel_pad(rect)
         inner_w = rect.width() - pad * 2
-        if inner_w < 40:
+        if inner_w < 24:
             return
 
+        # Label row, elided so a narrow tile keeps its own label cleanly.
         label_color = label_color or th.TEXT_3_C
         lc = QColor(label_color)
         lc.setAlphaF(max(0.0, label_alpha * 0.95))
         label_font = th.font(9.4, QFont.DemiBold)
-        painter.setFont(label_font)
-        painter.setPen(QPen(lc))
-        label_rect = QRectF(rect.left() + pad, rect.top() + 16, inner_w, 16)
-        painter.drawText(label_rect, int(Qt.AlignLeft | Qt.AlignVCenter), label)
+        label_metrics = QFontMetrics(label_font)
+        drawn_label = ""
+        if label_alpha > 0.02:
+            drawn_label = label
+            room = inner_w - (20 if warning else 0)
+            if label_metrics.horizontalAdvance(drawn_label) > room:
+                # A narrow tile prefers its compact name over an ellipsis.
+                if short_label and label_metrics.horizontalAdvance(short_label) <= room:
+                    drawn_label = short_label
+                else:
+                    drawn_label = label_metrics.elidedText(label, Qt.ElideRight,
+                                                           max(26.0, room))
+            painter.setFont(label_font)
+            painter.setPen(QPen(lc))
+            label_rect = QRectF(rect.left() + pad, rect.top() + 16, inner_w, 16)
+            painter.drawText(label_rect, int(Qt.AlignLeft | Qt.AlignVCenter), drawn_label)
 
         if warning and label_alpha > 0.05:
             # Cache-domain warning: a solid amber badge after the panel label.
-            metrics = QFontMetrics(label_font)
-            badge_x = label_rect.left() + metrics.horizontalAdvance(label) + 10
+            badge_x = rect.left() + pad + label_metrics.horizontalAdvance(drawn_label) + 10
             badge_y = label_rect.center().y()
             bc = QColor(th.AMBER)
             bc.setAlphaF(max(0.0, min(1.0, label_alpha)))
@@ -610,10 +738,12 @@ class SplitStage(QWidget):
                              int(Qt.AlignCenter), "!")
 
         # Count: a large numeral with a small unit word, baseline-aligned.
-        num_font = th.font(21, QFont.DemiBold)
+        # The word only joins the numeral when both fit the tile.
+        num_font = th.font(21.0 if rect.width() >= 200 else 17.0, QFont.DemiBold)
         word_font = th.font(9.8, QFont.Medium)
         num_metrics = QFontMetrics(num_font)
         word_metrics = QFontMetrics(word_font)
+        num_w = num_metrics.horizontalAdvance(count_n)
         baseline = rect.top() + 38 + num_metrics.ascent()
         nc = QColor(th.TEXT_C)
         nc.setAlphaF(max(0.0, count_alpha))
@@ -622,29 +752,42 @@ class SplitStage(QWidget):
         painter.setFont(num_font)
         painter.setPen(QPen(nc))
         painter.drawText(QPointF(rect.left() + pad, baseline), count_n)
-        painter.setFont(word_font)
-        painter.setPen(QPen(wc))
-        painter.drawText(QPointF(rect.left() + pad + num_metrics.horizontalAdvance(count_n) + 6,
-                                 baseline), count_word)
+        if num_w + 6 + word_metrics.horizontalAdvance(count_word) <= inner_w:
+            painter.setFont(word_font)
+            painter.setPen(QPen(wc))
+            painter.drawText(QPointF(rect.left() + pad + num_w + 6, baseline), count_word)
 
-        sc = QColor(th.TEXT_3_C)
-        sc.setAlphaF(max(0.0, sub_alpha))
-        painter.setFont(th.font(8.2, mono=True))
-        painter.setPen(QPen(sc))
-        painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, inner_w, 14),
-                         int(Qt.AlignLeft | Qt.AlignVCenter), sub)
-
-        # Live percentage, right-aligned on the range row.
-        if samples and sub_alpha > 0.05:
+        # Range row: the cpu list on the left, the live percentage on the
+        # right; the list is elided so the two never collide.
+        show_pct = bool(samples) and sub_alpha > 0.05
+        pct_font = th.font(8.2, QFont.DemiBold, mono=True)
+        pct_w = QFontMetrics(pct_font).horizontalAdvance("100%") + 10 if show_pct else 0.0
+        avail = inner_w - pct_w
+        sub_font = th.font(8.2, mono=True)
+        if avail >= 30:
+            sc = QColor(th.TEXT_3_C)
+            sc.setAlphaF(max(0.0, sub_alpha))
+            sub_metrics = QFontMetrics(sub_font)
+            text = sub
+            if sub_metrics.horizontalAdvance(text) > avail:
+                text = sub_metrics.elidedText(text, Qt.ElideRight, avail)
+            painter.setFont(sub_font)
+            painter.setPen(QPen(sc))
+            painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, avail, 14),
+                             int(Qt.AlignLeft | Qt.AlignVCenter), text)
+        if show_pct:
             cur = samples[-1][1 + series]
             vc = QColor(label_color)
             vc.setAlphaF(max(0.0, min(1.0, sub_alpha * 1.3)))
-            painter.setFont(th.font(8.2, QFont.DemiBold, mono=True))
+            painter.setFont(pct_font)
             painter.setPen(QPen(vc))
             painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, inner_w, 14),
                              int(Qt.AlignRight | Qt.AlignVCenter), f"{cur:.0f}%")
 
-        # Per-side usage curve, drawn inside the tile's empty middle band.
+        # Per-side usage curve in the tile's empty middle band. The curve is
+        # rendered `delay` seconds behind now and the leading edge is
+        # interpolated between samples, so fresh data slides in instead of
+        # snapping in once per poll.
         if samples is not None and accent is not None and len(samples) >= 2:
             now = time.monotonic()
             chart_top = rect.top() + 100.0
@@ -657,14 +800,36 @@ class SplitStage(QWidget):
                 painter.save()
                 painter.setClipPath(clip)
                 rate = inner_w / 60.0
-                pts = []
-                for (t, gv, tv) in samples:
-                    x = rect.right() - pad - (now - delay - t) * rate
-                    if x < rect.left() + pad:
-                        continue
-                    v = (gv, tv)[series]
-                    y = chart_bot - (max(0.0, min(100.0, v)) / 100.0) * (chart_bot - chart_top)
-                    pts.append(QPointF(x, y))
+
+                def x_of(ts):
+                    return rect.right() - pad - (now - delay - ts) * rate
+
+                def y_of(v):
+                    return chart_bot - (max(0.0, min(100.0, v)) / 100.0) * (chart_bot - chart_top)
+
+                tau = now - delay
+                data = list(samples)
+                cut = len(data)
+                for i, entry in enumerate(data):
+                    if entry[0] > tau:
+                        cut = i
+                        break
+                pts = [QPointF(x_of(entry[0]), y_of(entry[1 + series]))
+                       for entry in data[:cut] if x_of(entry[0]) >= rect.left() + pad - 2]
+                if 0 < cut:
+                    if cut < len(data):
+                        t0, g0, e0 = data[cut - 1]
+                        t1, g1, e1 = data[cut]
+                        f = (tau - t0) / max(1e-6, t1 - t0)
+                        f = 0.0 if f < 0.0 else (1.0 if f > 1.0 else f)
+                        v0, v1 = (g0, e0)[series], (g1, e1)[series]
+                        vx = v0 + (v1 - v0) * f
+                        lead_x = x_of(t0) + (x_of(t1) - x_of(t0)) * f
+                    else:
+                        t0, g0, e0 = data[-1]
+                        vx = (g0, e0)[series]
+                        lead_x = x_of(t0)
+                    pts.append(QPointF(lead_x, y_of(vx)))
                 if len(pts) >= 2:
                     path = QPainterPath(pts[0])
                     for i in range(1, len(pts)):
@@ -691,16 +856,24 @@ class SplitStage(QWidget):
                 painter.restore()
 
         # One dot per physical core, sized to fit the panel.
-        n = max(1, len(cores))
-        gap = 9.0
-        dot = max(6.0, min(13.0, (inner_w - gap * (n - 1)) / n))
-        cy = rect.bottom() - 24.0
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(dot_color)
-        x = rect.left() + pad
-        for _core in cores:
-            painter.drawEllipse(QPointF(x + dot / 2, cy), dot / 2, dot / 2)
-            x += dot + gap
+        if draw_dots:
+            colors = dot_colors or [dot_color] * len(cores)
+            n = max(1, len(cores))
+            dot, gap = self._dot_metrics(inner_w, n)
+            cy = rect.bottom() - 24.0
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(rect.left() + 1.5, rect.top() + 1.5,
+                                       rect.width() - 3, rect.height() - 3),
+                                max(1.0, radius - 1.5), max(1.0, radius - 1.5))
+            painter.save()
+            painter.setClipPath(clip)
+            painter.setPen(Qt.NoPen)
+            x = rect.left() + pad
+            for i, color in enumerate(colors):
+                painter.setBrush(color)
+                painter.drawEllipse(QPointF(x + dot / 2, cy), dot / 2, dot / 2)
+                x += dot + gap
+            painter.restore()
 
 
 # --------------------------------------------------------------------------- #
@@ -1394,11 +1567,13 @@ class MainWindow(QMainWindow):
             self.segments.set_mode(mode)
         self._mode = mode
         game_set = eng.parse_cpulist(snap["game_cpus"])
-        span = sum(1 for group in self.engine.topo.ccds if set(group) & game_set)
+        test_set = eng.parse_cpulist(snap["test_cpus"])
+        game_span = sum(1 for group in self.engine.topo.ccds if set(group) & game_set)
+        test_span = sum(1 for group in self.engine.topo.ccds if set(group) & test_set)
         self.stage.set_data(
             self.engine.topo, snap["game_cpus"], snap["test_cpus"],
             active=mode in ("smart", "hard"),
-            warning=span > 1,
+            warning_game=game_span > 1, warning_test=test_span > 1,
         )
         total = len(self.engine.topo.physical_cores())
         self.slider.set_total(total)
@@ -1437,12 +1612,19 @@ class MainWindow(QMainWindow):
         test = eng.parse_cpulist(test_cpus)
         n = self.engine.topo.core_count(game)
         m = self.engine.topo.core_count(test)
-        span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
-        if span > 1:
+        game_span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
+        test_span = sum(1 for group in self.engine.topo.ccds if set(group) & test)
+        if game_span > 1:
             self.slider_caption.setText(
-                f"{n} / {m} — the game side spans {span} cache domains: cross-CCD "
+                f"{n} / {m} — the game side spans {game_span} cache domains: cross-CCD "
                 "sync runs ~1.5–2× slower (measured), so expect a few % lower FPS "
                 "unless the game truly needs the extra cores")
+            self.slider_caption.setStyleSheet(
+                f"color: {th.AMBER_TEXT}; background: transparent;")
+        elif test_span > 1:
+            self.slider_caption.setText(
+                f"{n} / {m} — the test side spans {test_span} cache domains: tests "
+                "pay the cross-CCD latency while the game keeps a full domain")
             self.slider_caption.setStyleSheet(
                 f"color: {th.AMBER_TEXT}; background: transparent;")
         else:
@@ -1512,11 +1694,12 @@ class MainWindow(QMainWindow):
         self._update_slider_caption(self.cfg["game_cpus"], self.cfg["test_cpus"])
         # Reflect the new balance immediately; the engine's next tick makes it
         # real and the following snapshot confirms it.
-        span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
+        game_span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
+        test_span = sum(1 for group in self.engine.topo.ccds if set(group) & test)
         self.stage.set_data(
             self.engine.topo, self.cfg["game_cpus"], self.cfg["test_cpus"],
             active=self._mode in ("smart", "hard"),
-            warning=span > 1,
+            warning_game=game_span > 1, warning_test=test_span > 1,
         )
         self.engine.request("apply_config")
 
