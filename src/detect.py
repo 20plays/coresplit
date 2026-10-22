@@ -264,14 +264,61 @@ class Detector:
         self._candidate_polls = 0
         self._last_seen = 0.0
         self._current = None
+        self._roots: list = []
+        self._found_pids: list = []
+        self._names: dict[int, str] = {}
+        self._gamemode_cache: set[int] = set()
 
     # -- public ------------------------------------------------------------ #
 
+    def names(self) -> dict:
+        """Display names of the game roots seen on the last update()."""
+        return dict(self._names)
+
+    def current(self):
+        """The primary game, if one is confirmed."""
+        return self._current
+
+    def promote(self, pid):
+        """Make `pid` the primary game.
+
+        The engine follows the game being played (the CPU-hungry one); the
+        other games stay on the side as extras.
+        """
+        if self._current is None or pid == self._current.pid:
+            return
+        if all(item.pid != pid for item in self._roots):
+            return
+        self._roots = ([item for item in self._roots if item.pid == pid]
+                       + [item for item in self._roots if item.pid != pid])
+        self._current = self._roots[0]
+        self._refresh_extra_roots(self._found_pids)
+
     def update(self, procs, now):
+        # One gamemode query per poll; _match runs for every process.
+        self._gamemode_cache = self._gamemode_pids() if self.use_gamemode else set()
         found = self._find(procs)
 
-        if found:
-            self._last_seen = now
+        if not found:
+            if self._current is None:
+                self._candidate = None
+                self._candidate_polls = 0
+                return None
+            if now - self._last_seen >= self.exit_seconds:
+                self._current = None
+                self._candidate = None
+                self._candidate_polls = 0
+                return None
+            return self._current
+
+        self._last_seen = now
+        self._roots = [item for item in found if item.pid in procs]
+        self._found_pids = [item.pid for item in self._roots]
+        self._names = {item.pid: item.name for item in self._roots}
+
+        if self._current is None:
+            # Entering gaming needs several stable polls, so Proton's helper
+            # churn cannot flap the mode during loading screens.
             root = found[0]
             same = (
                 self._candidate is not None
@@ -282,24 +329,24 @@ class Detector:
                 self._candidate_polls = 1
             else:
                 self._candidate_polls += 1
-
             if self._candidate_polls >= self.enter_polls:
-                roots = [item for item in found if item.pid in procs]
-                self._candidate.extra_roots = tuple(item.pid for item in roots[1:])
                 self._current = self._candidate
+                self._refresh_extra_roots(self._found_pids)
             return self._current
 
-        if self._current is None:
-            self._candidate = None
-            self._candidate_polls = 0
-            return None
-
-        if now - self._last_seen >= self.exit_seconds:
-            self._current = None
-            self._candidate = None
-            self._candidate_polls = 0
-            return None
+        # A confirmed game keeps its role even when the root ordering flips
+        # (gamemode's client order is not stable); every other root rides
+        # along as an extra, so all running games land on the game side.
+        if self._current.pid not in self._found_pids:
+            # The primary exited while another game is still running: the
+            # role hands over without an end/start round trip.
+            self._current = self._roots[0]
+        self._refresh_extra_roots(self._found_pids)
         return self._current
+
+    def _refresh_extra_roots(self, found_pids):
+        self._current.extra_roots = tuple(
+            pid for pid in found_pids if pid != self._current.pid)
 
     # -- signals ----------------------------------------------------------- #
 
@@ -334,10 +381,8 @@ class Detector:
         if _is_client(proc):
             return None
 
-        if self.use_gamemode:
-            pid = self._gamemode_pid()
-            if pid and pid == proc.pid:
-                return GameInfo(proc.pid, _game_name(proc), proc.exe, "gamemode")
+        if self.use_gamemode and proc.pid in self._gamemode_cache:
+            return GameInfo(proc.pid, _game_name(proc), proc.exe, "gamemode")
 
         if self.use_paths and not _is_runtime_tool(proc) and not _is_shell(proc):
             location = f"{proc.exe} {proc.cmdline}"
@@ -363,8 +408,9 @@ class Detector:
 
     # -- external queries -------------------------------------------------- #
 
-    def _gamemode_pid(self):
-        """PIDs registered with gamemoded. Cheap enough to call once per poll."""
+    def _gamemode_pids(self):
+        """PIDs registered with gamemoded. One cheap query per poll; every
+        registered game counts, not just the first client."""
         try:
             result = subprocess.run(
                 [
@@ -376,12 +422,11 @@ class Detector:
                 capture_output=True, text=True, timeout=0.4,
             )
         except (OSError, subprocess.SubprocessError):
-            return None
+            return set()
         if result.returncode != 0 or not result.stdout:
-            return None
+            return set()
         # Output looks like: ([(12345, 0), (12346, 0)],)
-        pids = [int(value) for value in re.findall(r"\((\d+),\s*\d+\)", result.stdout)]
-        return pids[0] if pids else None
+        return {int(value) for value in re.findall(r"\((\d+),\s*\d+\)", result.stdout)}
 
     def _kwin_pid(self):
         try:

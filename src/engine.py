@@ -122,6 +122,9 @@ DEFAULT_CONFIG = {
     "auto_mode": "hard",
     "smart_renice": False,
     "smart_ioprio": False,
+    # With two games open, the background one gets its own cores on the game
+    # side but yields priority to the one being played.
+    "favour_foreground": True,
     "agent_scopes": [
         "app-zcode-", "app-opencode-", "app-code-", "app-ai.opencode",
         "app-com.heroicgameslauncher.hgl@",
@@ -370,6 +373,20 @@ class Topology:
             (game if index < game_cores else test).update(group)
         return game, test
 
+    def split_side(self, cpus, parts):
+        """Divide `cpus` into `parts` whole-physical-core blocks, so two games
+        sharing one side each get their own cores instead of colliding."""
+        wanted = set(cpus)
+        cores = [group for group in self.physical_cores() if set(group) & wanted]
+        groups = [[] for _ in range(max(1, parts))]
+        base, extra = divmod(len(cores), len(groups))
+        index = 0
+        for position, group in enumerate(groups):
+            take = base + (1 if position < extra else 0)
+            group.extend(cores[index:index + take])
+            index += take
+        return [set().union(*group) if group else set() for group in groups]
+
     def default_split(self):
         """Game gets the first CCD, tests get everything else."""
         game = set(self.ccds[0])
@@ -591,6 +608,7 @@ class PinnedEntry:
     start: int
     orig: list
     role: str
+    nice: int | None = None  # original nice, set when we raised it for a background game
 
 
 class EngineState:
@@ -637,6 +655,8 @@ class Engine:
         self._publisher = None
         self._guard_pids: set[int] = set()
         self._warned: set[int] = set()
+        self._promote_streak = 0
+        self._slice_sig = None
         from detect import Detector  # local import keeps detect.py free of cycles
         self._detector = Detector(cfg, self.topo)
 
@@ -805,6 +825,8 @@ class Engine:
             self._on_game_end()
         elif game:
             self._state.game = game
+        if self._state.game is not None:
+            self._follow_foreground(procs)
 
         self._apply(procs)
         self._update_guard_pids(procs)
@@ -854,6 +876,41 @@ class Engine:
         if self._auto_engaged:
             self._auto_engaged = False
             self._set_mode("off", manual=False)
+
+    def _follow_foreground(self, procs):
+        """With several games running, promote the one being played.
+
+        A played game burns CPU; a background one mostly idles. When another
+        game's tree out-burns the primary by a wide margin for a few polls, it
+        becomes the primary: it keeps the un-reniced half and the old primary
+        starts yielding to it.
+        """
+        game = self._state.game
+        extras = [pid for pid in getattr(game, "extra_roots", ()) if pid in procs]
+        if not extras:
+            self._promote_streak = 0
+            return
+        primary_cpu = self._tree_cpu(procs, [game.pid])
+        rival, rival_cpu = None, 0.0
+        for pid in extras:
+            cpu = self._tree_cpu(procs, [pid])
+            if cpu > rival_cpu:
+                rival, rival_cpu = pid, cpu
+        if rival_cpu > primary_cpu * 3 + 20.0:
+            self._promote_streak += 1
+            if self._promote_streak >= 2:
+                name = self._detector.names().get(rival, f"pid {rival}")
+                self._detector.promote(rival)
+                self._state.game = self._detector.current()
+                self._promote_streak = 0
+                self._log(f"{name} looks like the game being played; promoting it")
+                self._slice_sig = None
+        else:
+            self._promote_streak = 0
+
+    def _tree_cpu(self, procs, roots) -> float:
+        return sum(proc.cpu for proc in procs.values()
+                   if proc.pid in self._game_subtree(procs, roots))
 
     # -- classification ---------------------------------------------------- #
 
@@ -931,12 +988,32 @@ class Engine:
             self._restore_missing(procs, desired={})
             return
 
-        roots = set()
+        roots = []
         if state.game is not None and state.mode != "off":
-            roots.add(state.game.pid)
-            roots.update(getattr(state.game, "extra_roots", ()))
-        game_set = self._game_subtree(procs, roots) if roots else set()
+            roots.append(state.game.pid)
+            roots.extend(
+                pid for pid in getattr(state.game, "extra_roots", ()) if pid in procs)
+        # One subtree per root, so each running game can get its own cores.
+        per_root = [(pid, self._game_subtree(procs, [pid])) for pid in roots]
+        game_set = set()
+        for _pid, tree in per_root:
+            game_set |= tree
         state.game_set = game_set
+
+        # Several games on one side: slice the side into whole-physical-core
+        # blocks, one per game, so a background game cannot steal cycles from
+        # the one being played.
+        game_masks: dict[int, set] = {}
+        background: set[int] = set()
+        if len(per_root) > 1:
+            slices = self.topo.split_side(self.game_mask, len(per_root))
+            primary_tree = per_root[0][1]
+            for index, (_pid, tree) in enumerate(per_root):
+                if index > 0:
+                    background |= tree
+                for pid in tree:
+                    game_masks[pid] = slices[index]
+            self._log_slice_layout(per_root, slices, primary_tree)
 
         desired: dict[int, str] = {}
         protected = set(self.cfg["protected"])
@@ -975,15 +1052,23 @@ class Engine:
             proc = procs.get(pid)
             if proc is None:
                 continue
-            want = game_mask if role == "game" else test_mask
+            if role == "game":
+                want = game_masks.get(pid, game_mask)
+            else:
+                want = test_mask
             entry = state.pinned.get(pid)
+            if entry is not None and entry.nice is not None and pid not in background:
+                # No longer a background game (became primary, or its role
+                # changed): give back the original nice value.
+                self._set_nice(pid, entry.nice)
+                entry.nice = None
             if entry is None:
                 if not proc.affinity:
                     continue
                 entry = PinnedEntry(start=proc.starttime, orig=sorted(proc.affinity), role=role)
                 state.pinned[pid] = entry
                 self._dirty = True
-                self._pin(proc, want, role)
+                self._pin(proc, want, role, background=pid in background)
                 newly[role].append(proc)
             elif entry.start != proc.starttime:
                 # PID reused by a different process; drop the stale record.
@@ -992,10 +1077,10 @@ class Engine:
             elif entry.role != role:
                 entry.role = role
                 self._dirty = True
-                self._pin(proc, want, role)
+                self._pin(proc, want, role, background=pid in background)
                 newly[role].append(proc)
             elif proc.affinity != want:
-                self._pin(proc, want, role)
+                self._pin(proc, want, role, background=pid in background)
 
         self._log_pins(newly)
         self._restore_missing(procs, desired)
@@ -1012,7 +1097,30 @@ class Engine:
         preview = ", ".join(names[:6]) + ("…" if len(names) > 6 else "")
         self._log(f"pinned {len(tests)} background process(es) to test CCD ({preview})")
 
-    def _pin(self, proc, mask, role):
+    def _log_slice_layout(self, per_root, slices, primary_tree):
+        """One line when the per-game core layout changes, not every tick."""
+        names = self._detector.names() if hasattr(self, "_detector") else {}
+        signature = tuple(
+            (pid, tuple(sorted(slices[index])))
+            for index, (pid, _tree) in enumerate(per_root)
+        )
+        if getattr(self, "_slice_sig", None) == signature:
+            return
+        self._slice_sig = signature
+        parts = []
+        for index, (pid, tree) in enumerate(per_root):
+            name = names.get(pid) or (self._state.game.name if self._state.game else f"pid {pid}")
+            role = "foreground" if tree == primary_tree else "background"
+            parts.append(f"{name} ({role}) -> {format_cpulist(slices[index])}")
+        self._log(f"{len(per_root)} games share the game side: " + "; ".join(parts))
+
+    def _set_nice(self, pid, value):
+        try:
+            os.setpriority(os.PRIO_PROCESS, pid, value)
+        except OSError:
+            pass
+
+    def _pin(self, proc, mask, role, background=False):
         if not mask:
             return
         updated = set_affinity(proc.pid, mask)
@@ -1025,6 +1133,13 @@ class Engine:
             self._log(f"cannot pin pid {proc.pid} ({proc.comm}); leaving it unconstrained")
             return
         if role != "test":
+            # A background game keeps its own cores but yields priority to the
+            # one actually being played.
+            if background and self.cfg["favour_foreground"] and proc.nice < 5:
+                entry = self._state.pinned.get(proc.pid)
+                if entry is not None and entry.nice is None:
+                    entry.nice = proc.nice
+                self._set_nice(proc.pid, 5)
             return
         if self.cfg["smart_ioprio"]:
             _set_ioprio(proc.pid, 3, 0)
@@ -1053,6 +1168,9 @@ class Engine:
                 proc = True
         except Exception:
             proc = None
+        if entry.nice is not None:
+            self._set_nice(pid, entry.nice)
+            entry.nice = None
         if proc and entry.orig:
             set_affinity(pid, entry.orig)
 
@@ -1204,6 +1322,7 @@ class Engine:
                 "name": game.name,
                 "reason": game.reason,
             },
+            "games": self._game_names(),
             "game_cpus": self.cfg["game_cpus"],
             "test_cpus": self.cfg["test_cpus"],
             "all_cpus": format_cpulist(self.topo.all_cpus),
@@ -1212,6 +1331,19 @@ class Engine:
             "procs": rows,
             "logs": list(state.logs[-200:]),
         }
+
+    def _game_names(self):
+        """Display names of every game currently on the game side."""
+        game = self._state.game
+        if game is None:
+            return []
+        names = [game.name]
+        known = self._detector.names() if hasattr(self, "_detector") else {}
+        for pid in getattr(game, "extra_roots", ()):
+            name = known.get(pid)
+            if name and name not in names:
+                names.append(name)
+        return names
 
     def _emit_snapshot(self, procs=None):
         if procs is None:

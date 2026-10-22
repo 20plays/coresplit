@@ -277,6 +277,9 @@ def print_status(snapshot):
         print(f"game        {game['name']} (pid {game['pid']}, via {game['reason']})")
     else:
         print("game        none detected")
+    games = snapshot.get("games") or []
+    if len(games) > 1:
+        print(f"games       {len(games)} on the game side: " + " + ".join(games))
     return 0
 
 

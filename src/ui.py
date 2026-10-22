@@ -1500,6 +1500,15 @@ class MainWindow(QMainWindow):
             "Parked processes wait behind the game for disk access too.",
             self.ioprio_check))
 
+        self.favour_check = Switch()
+        self.favour_check.setChecked(bool(self.cfg["favour_foreground"]))
+        self.favour_check.toggled.connect(self._options_changed)
+        layout.addWidget(SettingRow(
+            "Favour the foreground game",
+            "With two games open, each gets its own cores on the game side and "
+            "the background one yields priority to the one being played.",
+            self.favour_check))
+
         self.autostart_check = Switch()
         self.autostart_check.setChecked(bool(self.cfg["autostart"]))
         self.autostart_check.toggled.connect(self._autostart_toggled)
@@ -1686,9 +1695,12 @@ class MainWindow(QMainWindow):
                 self.eyebrow.setStyleSheet(f"color: {accent}; background: transparent;")
                 self.title.setText(game["name"])
                 n = counts.get("game", 0)
+                games = snap.get("games") or [game["name"]]
+                others = " + ".join(games[1:])
+                sharing = f" · sharing the half with {others}" if others else ""
                 self.subtitle.setText(
                     f"{n} process{'es' if n != 1 else ''} on the game side · "
-                    f"detected via {game['reason']}")
+                    f"detected via {game['reason']}{sharing}")
             else:
                 self.eyebrow.setText(f"{word} · active")
                 self.eyebrow.setStyleSheet(f"color: {accent}; background: transparent;")
@@ -1748,6 +1760,7 @@ class MainWindow(QMainWindow):
     def _options_changed(self):
         self.cfg["smart_renice"] = self.renice_check.isChecked()
         self.cfg["smart_ioprio"] = self.ioprio_check.isChecked()
+        self.cfg["favour_foreground"] = self.favour_check.isChecked()
         self.cfg.save()
         self.engine.request("apply_config")
 
