@@ -1,4 +1,4 @@
-# CoreSplit
+<h1>CoreSplit <br> <sub style="color: gray;">Play videogames without your agents making you lag, or stealing your cursor focus</sub></h1>
 
 ![CoreSplit window](docs/screenshot.png)
 
