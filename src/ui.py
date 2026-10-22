@@ -20,7 +20,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QFont, QFontMetrics, QIcon,
-    QPainter, QPen,
+    QPainter, QPainterPath, QPen,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -174,6 +174,7 @@ class ModeSelector(QWidget):
         self._index = 0
         self._pos = 0.0
         self._hover = -1
+        self._busy = False
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(220)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
@@ -181,6 +182,12 @@ class ModeSelector(QWidget):
 
     def mode(self) -> str:
         return self.OPTIONS[self._index][0]
+
+    def set_busy(self, busy: bool):
+        """Dim and lock the control while the engine catches up."""
+        if busy != self._busy:
+            self._busy = bool(busy)
+            self.update()
 
     def set_mode(self, mode: str):
         for index, (key, _) in enumerate(self.OPTIONS):
@@ -219,8 +226,11 @@ class ModeSelector(QWidget):
 
         key = self.mode()
         accent = {"off": th.q("#262d3a"), "smart": th.BLUE_C, "hard": th.AMBER_C}[key]
+        if self._busy:
+            accent = th.mix(accent, th.q(th.INK), 0.45)
         thumb = self._segment_rect(self._pos)
-        painter.setPen(QPen(th.q("#3d4655"), 1) if key == "off" else Qt.NoPen)
+        dim_border = th.mix(th.q("#3d4655"), th.q(th.INK), 0.45)
+        painter.setPen(QPen(dim_border, 1) if key == "off" else Qt.NoPen)
         painter.setBrush(accent)
         painter.drawRoundedRect(thumb, 18, 18)
 
@@ -230,10 +240,12 @@ class ModeSelector(QWidget):
             segment = self._segment_rect(index)
             if index == self._index:
                 color = th.q("#221708") if option_key != "off" else th.TEXT_C
-            elif index == self._hover:
+            elif index == self._hover and not self._busy:
                 color = th.TEXT_C
             else:
                 color = th.TEXT_3_C
+            if self._busy:
+                color = th.mix(color, th.q(th.INK), 0.45)
             painter.setPen(QPen(color))
             painter.drawText(segment, int(Qt.AlignCenter), label)
         painter.end()
@@ -244,6 +256,8 @@ class ModeSelector(QWidget):
         return max(0, min(len(self.OPTIONS) - 1, int((x - rect.left()) // width)))
 
     def mousePressEvent(self, event):
+        if self._busy:
+            return
         if event.button() == Qt.LeftButton:
             index = self._index_at(event.position().x())
             if index != self._index:
@@ -266,6 +280,8 @@ class ModeSelector(QWidget):
         super().leaveEvent(event)
 
     def keyPressEvent(self, event):
+        if self._busy:
+            return
         if event.key() in (Qt.Key_Left, Qt.Key_Right):
             step = -1 if event.key() == Qt.Key_Left else 1
             index = max(0, min(len(self.OPTIONS) - 1, self._index + step))
@@ -276,6 +292,126 @@ class ModeSelector(QWidget):
                 self.changed.emit(self.OPTIONS[index][0])
             return
         super().keyPressEvent(event)
+
+
+# --------------------------------------------------------------------------- #
+# split slider
+# --------------------------------------------------------------------------- #
+
+class SplitSlider(QWidget):
+    """A two-coloured balance control: amber = game cores, blue = the rest.
+
+    The thumb marks the boundary between the two sets in physical cores; the
+    engine keeps whole cores (SMT siblings together), so every stop is a sane
+    split. `changed` fires on release so a drag doesn't re-pin per pixel.
+    """
+
+    changed = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(460, 44)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._total = 2
+        self._game = 1
+        self._dragging = False
+        self._hover = False
+
+    def total(self) -> int:
+        return self._total
+
+    def game_cores(self) -> int:
+        return self._game
+
+    def is_dragging(self) -> bool:
+        return self._dragging
+
+    def set_total(self, total: int):
+        total = max(2, int(total))
+        if total != self._total:
+            self._total = total
+            self._game = min(self._game, total - 1)
+            self.update()
+
+    def set_game_cores(self, game: int):
+        game = max(1, min(self._total - 1, int(game)))
+        if game != self._game:
+            self._game = game
+            self.update()
+
+    def _game_at(self, x: float) -> int:
+        width = self.width() - 28.0
+        return max(1, min(self._total - 1, round((x - 14.0) / width * self._total)))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self.set_game_cores(self._game_at(event.position().x()))
+            self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self.set_game_cores(self._game_at(event.position().x()))
+        hovered = self.rect().contains(event.position().toPoint())
+        if hovered != self._hover:
+            self._hover = hovered
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            self.update()
+            self.changed.emit(self._game)
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Left, Qt.Key_Right):
+            step = -1 if event.key() == Qt.Key_Left else 1
+            value = max(1, min(self._total - 1, self._game + step))
+            if value != self._game:
+                self._game = value
+                self.update()
+                self.changed.emit(value)
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        width = self.width()
+        mid = self.height() / 2.0
+        pad = 14.0
+        track_h = 10.0
+        track = QRectF(pad, mid - track_h / 2, width - pad * 2, track_h)
+        split_x = track.left() + track.width() * self._game / self._total
+
+        path = QPainterPath()
+        path.addRoundedRect(track, track_h / 2, track_h / 2)
+        painter.save()
+        painter.setClipPath(path)
+        painter.setPen(Qt.NoPen)
+        painter.fillRect(QRectF(track.left(), track.top(), split_x - track.left(), track_h), th.tint(th.AMBER_C, 200))
+        painter.fillRect(QRectF(split_x, track.top(), track.right() - split_x + 1, track_h), th.tint(th.BLUE_C, 200))
+        painter.restore()
+        painter.setPen(QPen(th.LINE_C, 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(track, track_h / 2, track_h / 2)
+
+        radius = 13.5 if (self._dragging or self._hover) else 12.0
+        painter.setPen(QPen(th.tint(th.TEXT_C, 230), 2))
+        painter.setBrush(th.q(th.INK))
+        painter.drawEllipse(QPointF(split_x, mid), radius, radius)
+
+        painter.setFont(th.caps_font(7.2, spacing=1.2))
+        painter.setPen(QPen(th.mix(th.TEXT_3_C, th.AMBER_C, 0.5)))
+        painter.drawText(QRectF(0, 0, track.left() + 40, 14), int(Qt.AlignLeft | Qt.AlignVCenter), "GAME")
+        painter.setPen(QPen(th.mix(th.TEXT_3_C, th.BLUE_C, 0.5)))
+        painter.drawText(QRectF(track.right() - 40, 0, 40, 14), int(Qt.AlignRight | Qt.AlignVCenter), "TESTS")
+        painter.end()
 
 
 # --------------------------------------------------------------------------- #
@@ -669,6 +805,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CoreSplit")
         self.resize(1000, 700)
         self.setMinimumSize(880, 640)
+        self._pending_mode: str | None = None
+        self._pending_timer = QTimer(self)
+        self._pending_timer.setSingleShot(True)
+        self._pending_timer.setInterval(3000)
+        self._pending_timer.timeout.connect(self._pending_expired)
 
         self._build()
         bridge.snapshot.connect(self._on_snapshot)
@@ -754,6 +895,23 @@ class MainWindow(QMainWindow):
         stage_holder.addStretch(1)
         column.addLayout(stage_holder)
 
+        column.addSpacing(20)
+
+        slider_holder = QHBoxLayout()
+        slider_holder.addStretch(1)
+        self.slider = SplitSlider()
+        self.slider.changed.connect(self._slider_changed)
+        slider_holder.addWidget(self.slider)
+        slider_holder.addStretch(1)
+        column.addLayout(slider_holder)
+        column.addSpacing(6)
+
+        self.slider_caption = QLabel("")
+        self.slider_caption.setFont(th.font(8.8))
+        self.slider_caption.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
+        self.slider_caption.setAlignment(Qt.AlignCenter)
+        column.addWidget(self.slider_caption)
+
         column.addStretch(1)
 
         selector_holder = QHBoxLayout()
@@ -799,7 +957,32 @@ class MainWindow(QMainWindow):
         auto_row.addStretch(1)
         column.addLayout(auto_row)
 
-        column.addSpacing(14)
+        column.addSpacing(10)
+
+        guard_row = QHBoxLayout()
+        guard_row.addStretch(1)
+        guard_row.setSpacing(10)
+        self.guard_check = Switch()
+        self.guard_check.setChecked(bool(self.cfg["focus_guard"]))
+        self.guard_check.toggled.connect(self._guard_toggled)
+        guard_label = QLabel("Focus guard — agents can't steal focus")
+        guard_label.setFont(th.font(9.4))
+        guard_label.setStyleSheet(f"color: {th.TEXT_2}; background: transparent;")
+        guard_row.addWidget(self.guard_check)
+        guard_row.addWidget(guard_label)
+        guard_row.addStretch(1)
+        column.addLayout(guard_row)
+
+        column.addSpacing(4)
+
+        self.guard_hint = QLabel("")
+        self.guard_hint.setFont(th.font(8.6))
+        self.guard_hint.setStyleSheet(f"color: {th.AMBER_TEXT}; background: transparent;")
+        self.guard_hint.setAlignment(Qt.AlignCenter)
+        self.guard_hint.setVisible(False)
+        column.addWidget(self.guard_hint)
+
+        column.addSpacing(10)
 
         self.recent = QLabel("")
         self.recent.setFont(th.font(8.4))
@@ -990,23 +1173,6 @@ class MainWindow(QMainWindow):
             "Hidden in the tray, ready before the first game launches.",
             self.autostart_check))
 
-        self.guard_check = Switch()
-        self.guard_check.setChecked(bool(self.cfg["focus_guard"]))
-        self.guard_check.toggled.connect(self._guard_toggled)
-        layout.addWidget(SettingRow(
-            "Focus guard",
-            "Agent windows are bounced before they can steal focus from a game. "
-            "Your own alt-tab still works.",
-            self.guard_check))
-
-        self.guard_hint = QLabel("")
-        self.guard_hint.setObjectName("Hint")
-        self.guard_hint.setWordWrap(True)
-        left_indent = QHBoxLayout()
-        left_indent.addSpacing(0)
-        left_indent.addWidget(self.guard_hint, 1)
-        layout.addLayout(left_indent)
-
         layout.addSpacing(14)
         layout.addWidget(divider())
         layout.addSpacing(14)
@@ -1087,11 +1253,27 @@ class MainWindow(QMainWindow):
 
     def _on_snapshot(self, snap):
         mode = snap["mode"]
-        self.segments.set_mode(mode)
+        # While a user-picked mode is in flight, snapshots must not move the
+        # selector — the engine's echo of the old mode would drag it back
+        # before the new mode lands. Matching echoes confirm and unlock.
+        if self._pending_mode is not None:
+            if mode == self._pending_mode:
+                self._pending_mode = None
+                self.segments.set_busy(False)
+                self._pending_timer.stop()
+                self.segments.set_mode(mode)
+        else:
+            self.segments.set_mode(mode)
         self.stage.set_data(
             self.engine.topo, snap["game_cpus"], snap["test_cpus"],
             active=mode in ("smart", "hard"),
         )
+        total = len(self.engine.topo.physical_cores())
+        self.slider.set_total(total)
+        if not self.slider.is_dragging():
+            self.slider.set_game_cores(
+                self.engine.topo.core_count(eng.parse_cpulist(snap["game_cpus"])))
+        self._update_slider_caption(snap["game_cpus"], snap["test_cpus"])
         self._update_status_text(snap)
         self.model.set_rows(snap["procs"])
         self._update_split_hint()
@@ -1100,6 +1282,23 @@ class MainWindow(QMainWindow):
         if self.log_view.document().isEmpty() and snap["logs"]:
             for line in snap["logs"]:
                 self._append_log(line)
+
+    def _pending_expired(self):
+        # The engine never echoed the new mode (e.g. it is not running):
+        # release the lock so the selector isn't stuck dimmed.
+        self._pending_mode = None
+        self.segments.set_busy(False)
+
+    def _update_slider_caption(self, game_cpus: str, test_cpus: str):
+        game = eng.parse_cpulist(game_cpus)
+        test = eng.parse_cpulist(test_cpus)
+        n = self.engine.topo.core_count(game)
+        m = self.engine.topo.core_count(test)
+        text = f"{n} / {m} cores"
+        span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
+        if span > 1:
+            text += f" · game side spans {span} cache domains — fine, slightly slower for the game"
+        self.slider_caption.setText(text)
 
     def _update_status_text(self, snap):
         mode = snap["mode"]
@@ -1150,7 +1349,20 @@ class MainWindow(QMainWindow):
     # -- user actions ------------------------------------------------------ #
 
     def _user_set_mode(self, mode):
+        self._pending_mode = mode
+        self.segments.set_busy(True)
+        self._pending_timer.start()
         self.engine.set_mode(mode, manual=True)
+
+    def _slider_changed(self, game_cores: int):
+        game, test = self.engine.topo.split_by_core_count(game_cores)
+        self.cfg["game_cpus"] = eng.format_cpulist(game)
+        self.cfg["test_cpus"] = eng.format_cpulist(test)
+        self.cfg.save()
+        self.game_cpus.setText(self.cfg["game_cpus"])
+        self.test_cpus.setText(self.cfg["test_cpus"])
+        self._update_slider_caption(self.cfg["game_cpus"], self.cfg["test_cpus"])
+        self.engine.request("apply_config")
 
     def _auto_toggled(self, checked):
         self.cfg["auto_enable"] = bool(checked)
@@ -1182,21 +1394,16 @@ class MainWindow(QMainWindow):
         self._refresh_guard_hint()
 
     def _refresh_guard_hint(self):
+        # On the status screen the hint is only shown when something is wrong:
+        # the guard is on but its KWin service is unreachable.
         if not hasattr(self, "guard_hint"):
             return
-        if not self.cfg["focus_guard"]:
-            self.guard_hint.setText("Off — agent windows may take focus from the game.")
-            self.guard_hint.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
-            return
-        if getattr(self, "_guard_ready", False):
-            self.guard_hint.setText(
-                "On — agent windows are bounced while a game is protected.")
-            self.guard_hint.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
-        else:
-            self.guard_hint.setText(
-                "The KWin script is installed but CoreSplit's focus service is not "
-                "reachable, so the guard is inactive.")
-            self.guard_hint.setStyleSheet(f"color: {th.AMBER_TEXT}; background: transparent;")
+        warn = (bool(self.cfg["focus_guard"])
+                and not getattr(self, "_guard_ready", False))
+        self.guard_hint.setText(
+            "The guard is on but CoreSplit's focus service is not reachable, "
+            "so it is inactive.")
+        self.guard_hint.setVisible(warn)
 
     def _autostart_toggled(self, checked):
         self.cfg["autostart"] = bool(checked)

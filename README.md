@@ -2,48 +2,56 @@
 
 ![CoreSplit window](docs/screenshot.png)
 
-One CCD for the game, one for everything else — so tests, builds and AI agents
-stop causing frame-time spikes. Includes a focus guard that stops agent windows
-from stealing focus mid-game.
+Your CPU is really two chips in one package, each with its own pool of fast
+cache. A game only needs one of them. CoreSplit keeps everything else on your
+PC (test runs, compiles, coding agents) on the other one while you play, and
+puts it all back when you're done.
 
-## Problem
+## The problem
 
-A CPU affinity mask is a permission, not an exclusion. Pinning the game to a
-CCD doesn't keep anything else off it: every unpinned process is free to wander
-onto the game's cores, which is exactly where background tests and agents cause
-frame-time spikes. And when an agent steals mouse focus mid-fight, frame time
-stops mattering anyway.
+When a test run or an agent works while you game, it competes with the game
+for cores and your frame times spike. Pinning the game to specific cores
+doesn't help, because other programs can still use those cores too. You'd have
+to move every other process away by hand, and keep doing it as new ones spawn.
+And agents love popping up terminal windows that steal your mouse mid-game.
 
-## Solution
+## What it does
 
-CoreSplit watches for a game (GameMode, install paths, launcher scopes) and
-sweeps everything else onto the other CCD until the game exits.
+While a game is running, CoreSplit moves your other programs to the other half
+of the CPU, and moves everything back once you quit. It notices games through
+GameMode, Steam/Lutris/Heroic install locations, or launcher processes.
 
-- **Hard** — all of your processes move off the game CCD. Classifies nothing,
-  misses nothing. The default.
-- **Smart** — only processes recognised as tests or agents move.
-- **Focus guard** — a KWin script bounces agent windows before they are ever
-  drawn as focused. Your own alt-tab still works; insisting twice within three
-  seconds gets you through.
+- **Hard** (default): moves everything of yours off the game's half. It can't
+  misidentify anything, so nothing slips through.
+- **Smart**: moves only the stuff that looks like tests or agents.
 
-Cores are grouped by L3 cache domain, not by number, so the 9900X's
-non-contiguous layout (0-5 + 12-17 / 6-11 + 18-23) splits correctly and keeps
-working if the hardware changes.
+A slider sets how many cores each side gets. Six and six is the default and
+the best case, because then each side keeps its own cache to itself. Giving
+the game more makes it use both halves at once, which is slower per core, so
+only do that if a specific game really needs it.
 
-## Implementation
+The focus guard blocks agent windows from taking your mouse and keyboard while
+you play. Your own alt-tab still works, and if you try to open a blocked
+window twice within three seconds it gets through.
 
-Python 3 + PySide6, no root, no system packages. An engine thread scans
-`/proc`, classifies processes, and applies affinity masks directly; every pin
-records its original mask and start time to `state.json`, so a killed session
-restores cleanly and reused PIDs are never restored onto the wrong process.
-The GUI talks to the engine over Qt signals; a Unix socket at
-`$XDG_RUNTIME_DIR/coresplit/control.sock` lets the CLI drive a running
-instance.
+## How it works
+
+A Python app with a PySide6 window. A background thread watches the process
+list and, when a game shows up, rewrites the CPU affinity (the list of cores a
+process may run on) of everything you own. Before touching a process it saves
+the original affinity to a state file, so if the app crashes or gets killed,
+the next start puts everything back the way it was. It never restores onto a
+PID that now belongs to a different process. The window, tray icon and the
+`coresplit` command all control the same background engine.
+
+Cores are grouped by shared L3 cache instead of by number, so the odd core
+layout of these chips (cores 0-5 plus 12-17 on one half) is handled correctly
+and keeps working on other hardware.
 
 ## Install
 
-Requires Linux, KDE Plasma (for the focus guard), Python 3 with PySide6, and
-`taskset` from util-linux.
+Needs Linux, KDE Plasma (only for the focus guard), Python 3 with PySide6, and
+`taskset`.
 
 ```bash
 git clone https://github.com/20plays/coresplit.git
@@ -51,25 +59,24 @@ cd coresplit
 ./install.sh
 ```
 
-No root; everything lands in `~/.local`. Missing PySide6:
+No root, nothing outside your home folder. If PySide6 is missing:
 `pip install PySide6` or `pacman -S python-pyside6`.
 
-## Usage
+## Commands
 
 ```bash
-coresplit                     # open the window (lives in the tray on close)
+coresplit                     # open the window (it hides to the tray on close)
 coresplit smart|hard|off      # switch mode in a running instance
 coresplit focusguard on|off   # toggle the focus guard
-coresplit status              # print current state
-coresplit detect              # show what the game detector sees
-coresplit reset               # release every pin, even if the app is dead
+coresplit status              # what is it doing right now
+coresplit detect              # which game does it see
+coresplit reset               # unpin everything, even if the app died
 ```
 
-`coresplit --tray` starts hidden (used by autostart); `coresplit daemon` runs
-headless. For the most reliable pinning, the app's Settings page copies the
-exact `taskset -c … gamemoderun %command%` line for your CPU to paste into a
-game's Steam launch options, and installs a `testcpus` wrapper for one-off
-runs: `testcpus cargo test`.
+`coresplit --tray` starts hidden in the tray, `coresplit daemon` runs without a
+window. For games you play often, the Settings page gives you a `taskset` line
+to paste into Steam launch options so the game is pinned before it even
+starts.
 
 ## License
 
