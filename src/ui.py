@@ -567,7 +567,7 @@ class SplitStage(QWidget):
         t = self._morph_t
         morphing = t < 1.0 and bool(self._from_game)
         width = self.width()
-        height = float(self.HEIGHT)
+        height = float(self.height())
         radius = 24.0
 
         game_fill = th.mix(th.q(th.SURFACE), th.tint(th.AMBER_C, 30), p)
@@ -667,12 +667,12 @@ class SplitStage(QWidget):
         inner_o = other_rect.width() - pad_o * 2
         dot_g, gap_g = self._dot_metrics(inner_g, n_to)
         dot_o, gap_o = self._dot_metrics(inner_o, self._total - n_to)
-        cy = height - 24.0
         layer = []
 
         def slot_x(rect, pad, dot, gap, slot):
             return rect.left() + pad + slot * (dot + gap) + dot / 2
 
+        cy = height - height * 0.122
         for i in range(self._total):
             if i < n_from:
                 fx, c0 = slot_x(game_rect, pad_g, dot_g, gap_g, i), game_dot
@@ -718,7 +718,8 @@ class SplitStage(QWidget):
                                                            max(26.0, room))
             painter.setFont(label_font)
             painter.setPen(QPen(lc))
-            label_rect = QRectF(rect.left() + pad, rect.top() + 16, inner_w, 16)
+            label_rect = QRectF(rect.left() + pad, rect.top() + rect.height() * 0.082,
+                                inner_w, 16)
             painter.drawText(label_rect, int(Qt.AlignLeft | Qt.AlignVCenter), drawn_label)
 
         if warning and label_alpha > 0.05:
@@ -739,12 +740,13 @@ class SplitStage(QWidget):
 
         # Count: a large numeral with a small unit word, baseline-aligned.
         # The word only joins the numeral when both fit the tile.
-        num_font = th.font(21.0 if rect.width() >= 200 else 17.0, QFont.DemiBold)
+        num_font = th.font(21.0 if rect.width() >= 200 and rect.height() >= 180 else 17.0,
+                           QFont.DemiBold)
         word_font = th.font(9.8, QFont.Medium)
         num_metrics = QFontMetrics(num_font)
         word_metrics = QFontMetrics(word_font)
         num_w = num_metrics.horizontalAdvance(count_n)
-        baseline = rect.top() + 38 + num_metrics.ascent()
+        baseline = rect.top() + rect.height() * 0.195 + num_metrics.ascent()
         nc = QColor(th.TEXT_C)
         nc.setAlphaF(max(0.0, count_alpha))
         wc = QColor(th.TEXT_2_C)
@@ -764,6 +766,7 @@ class SplitStage(QWidget):
         pct_w = QFontMetrics(pct_font).horizontalAdvance("100%") + 10 if show_pct else 0.0
         avail = inner_w - pct_w
         sub_font = th.font(8.2, mono=True)
+        sub_y = rect.top() + rect.height() * 0.388
         if avail >= 30:
             sc = QColor(th.TEXT_3_C)
             sc.setAlphaF(max(0.0, sub_alpha))
@@ -773,7 +776,7 @@ class SplitStage(QWidget):
                 text = sub_metrics.elidedText(text, Qt.ElideRight, avail)
             painter.setFont(sub_font)
             painter.setPen(QPen(sc))
-            painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, avail, 14),
+            painter.drawText(QRectF(rect.left() + pad, sub_y, avail, 14),
                              int(Qt.AlignLeft | Qt.AlignVCenter), text)
         if show_pct:
             cur = samples[-1][1 + series]
@@ -781,7 +784,7 @@ class SplitStage(QWidget):
             vc.setAlphaF(max(0.0, min(1.0, sub_alpha * 1.3)))
             painter.setFont(pct_font)
             painter.setPen(QPen(vc))
-            painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, inner_w, 14),
+            painter.drawText(QRectF(rect.left() + pad, sub_y, inner_w, 14),
                              int(Qt.AlignRight | Qt.AlignVCenter), f"{cur:.0f}%")
 
         # Per-side usage curve in the tile's empty middle band. The curve is
@@ -790,8 +793,8 @@ class SplitStage(QWidget):
         # snapping in once per poll.
         if samples is not None and accent is not None and len(samples) >= 2:
             now = time.monotonic()
-            chart_top = rect.top() + 100.0
-            chart_bot = rect.bottom() - 48.0
+            chart_top = rect.top() + rect.height() * 0.51
+            chart_bot = rect.bottom() - rect.height() * 0.245
             if chart_bot - chart_top > 14.0:
                 clip = QPainterPath()
                 clip.addRoundedRect(QRectF(rect.left() + 1.5, rect.top() + 1.5,
@@ -814,8 +817,23 @@ class SplitStage(QWidget):
                     if entry[0] > tau:
                         cut = i
                         break
-                pts = [QPointF(x_of(entry[0]), y_of(entry[1 + series]))
-                       for entry in data[:cut] if x_of(entry[0]) >= rect.left() + pad - 2]
+                boundary = rect.left() + pad
+                visible = [(x_of(entry[0]), entry[1 + series]) for entry in data[:cut]]
+                start = 0
+                while start < len(visible) and visible[start][0] < boundary:
+                    start += 1
+                pts = []
+                if start < len(visible):
+                    if start > 0:
+                        # Let the tail slide out through the edge: interpolate
+                        # at the boundary instead of dropping whole samples,
+                        # which yanked the left end once per poll.
+                        x0, v0 = visible[start - 1]
+                        x1, v1 = visible[start]
+                        f = (boundary - x0) / max(1e-6, x1 - x0)
+                        pts.append(QPointF(boundary, y_of(v0 + (v1 - v0) * f)))
+                    for x, v in visible[start:]:
+                        pts.append(QPointF(x, y_of(v)))
                 if 0 < cut:
                     if cut < len(data):
                         t0, g0, e0 = data[cut - 1]
@@ -860,7 +878,7 @@ class SplitStage(QWidget):
             colors = dot_colors or [dot_color] * len(cores)
             n = max(1, len(cores))
             dot, gap = self._dot_metrics(inner_w, n)
-            cy = rect.bottom() - 24.0
+            cy = rect.bottom() - rect.height() * 0.122
             clip = QPainterPath()
             clip.addRoundedRect(QRectF(rect.left() + 1.5, rect.top() + 1.5,
                                        rect.width() - 3, rect.height() - 3),
@@ -1099,7 +1117,7 @@ class MainWindow(QMainWindow):
         self.cfg = config
         self.setWindowTitle("CoreSplit")
         self.resize(1000, 720)
-        self.setMinimumSize(880, 660)
+        self.setMinimumSize(620, 440)
         self._pending_mode: str | None = None
         self._mode = "off"
         self._pending_timer = QTimer(self)
@@ -1128,7 +1146,23 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._status_page())
         self.stack.addWidget(self._processes_page())
         self.stack.addWidget(self._settings_page())
-        outer.addWidget(self.stack, 1)
+        # Pages scroll instead of clipping when the window is small, so
+        # quarter-tiling stays usable.
+        pages = QScrollArea()
+        pages.setWidgetResizable(True)
+        pages.setFrameShape(QFrame.NoFrame)
+        pages.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        pages.viewport().setObjectName("ScrollViewport")
+        pages.setWidget(self.stack)
+        outer.addWidget(pages, 1)
+
+    def resizeEvent(self, event):
+        if hasattr(self, "stage"):
+            # The stage rides the window width so tiled layouts shrink it with
+            # everything else instead of forcing a tall minimum window.
+            self.stage.setFixedHeight(
+                max(148, min(SplitStage.HEIGHT, round(self.width() * 0.205))))
+        super().resizeEvent(event)
 
     def _header(self):
         row = QHBoxLayout()

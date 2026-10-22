@@ -114,6 +114,8 @@ _QSS = Template("""
 QWidget { color: $TEXT; font-family: "$SANS", "Noto Sans", "DejaVu Sans", sans-serif; font-size: 10pt; }
 QMainWindow, QWidget#Root { background: $INK; }
 QWidget#ScrollContent, QWidget#ScrollViewport { background: transparent; }
+/* a QStackedWidget inside a scroll area otherwise fills with the palette */
+QStackedWidget { background: transparent; }
 QScrollArea { background: transparent; border: none; }
 
 QLabel { background: transparent; }
