@@ -444,8 +444,9 @@ class SplitStage(QWidget):
         self._anim.setDuration(420)
         self._anim.setEasingCurve(QEasingCurve.InOutCubic)
         self._anim.valueChanged.connect(self._on_anim)
+        self._warning = False
 
-    def set_data(self, topo, game_cpus, test_cpus, active: bool):
+    def set_data(self, topo, game_cpus, test_cpus, active: bool, warning: bool = False):
         game = eng.parse_cpulist(game_cpus)
         test = eng.parse_cpulist(test_cpus)
         self._game_cores = [core for core in topo.physical_cores() if set(core) & game]
@@ -454,6 +455,7 @@ class SplitStage(QWidget):
         self._game_range = fmt_range(eng.format_cpulist(sorted(game)))
         self._other_range = fmt_range(eng.format_cpulist(sorted(test)))
         self._all_range = fmt_range(eng.format_cpulist(topo.all_cpus))
+        self._warning = bool(warning)
         target = 1.0 if active else 0.0
         if target != self._target:
             self._target = target
@@ -522,6 +524,7 @@ class SplitStage(QWidget):
                 sub=self._game_range, sub_alpha=fade * 0.85,
                 cores=self._game_cores,
                 dot_color=th.mix(th.q("#5b6474"), th.AMBER_C, p),
+                warning=self._warning,
             )
             self._panel(
                 painter, other_rect, radius, other_fill, other_border,
@@ -534,7 +537,8 @@ class SplitStage(QWidget):
         painter.end()
 
     def _panel(self, painter, rect: QRectF, radius, fill, border, *, label, label_alpha,
-               label_color=None, count, count_alpha, sub, sub_alpha, cores, dot_color):
+               label_color=None, count, count_alpha, sub, sub_alpha, cores, dot_color,
+               warning=False):
         painter.setPen(QPen(border, 1))
         painter.setBrush(fill)
         painter.drawRoundedRect(rect, radius, radius)
@@ -551,6 +555,23 @@ class SplitStage(QWidget):
         painter.setPen(QPen(lc))
         painter.drawText(QRectF(rect.left() + pad, rect.top() + 18, inner_w, 14),
                          int(Qt.AlignLeft | Qt.AlignVCenter), label)
+
+        if warning and label_alpha > 0.05:
+            # Cache-domain warning: a solid amber badge after the panel label.
+            metrics = QFontMetrics(th.caps_font(7.8, spacing=1.5))
+            badge_x = rect.left() + pad + metrics.horizontalAdvance(label) + 14
+            badge_y = rect.top() + 25
+            bc = QColor(th.AMBER)
+            bc.setAlphaF(max(0.0, min(1.0, label_alpha)))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(bc)
+            painter.drawEllipse(QPointF(badge_x, badge_y), 7.0, 7.0)
+            pc = QColor(th.q("#221708"))
+            pc.setAlphaF(max(0.0, min(1.0, label_alpha)))
+            painter.setFont(th.font(8.4, QFont.Bold))
+            painter.setPen(QPen(pc, 1.4))
+            painter.drawText(QRectF(badge_x - 7, badge_y - 7, 14, 14),
+                             int(Qt.AlignCenter), "!")
 
         cc = QColor(th.TEXT_C)
         cc.setAlphaF(max(0.0, count_alpha))
@@ -806,6 +827,7 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
         self.setMinimumSize(880, 640)
         self._pending_mode: str | None = None
+        self._mode = "off"
         self._pending_timer = QTimer(self)
         self._pending_timer.setSingleShot(True)
         self._pending_timer.setInterval(3000)
@@ -910,6 +932,7 @@ class MainWindow(QMainWindow):
         self.slider_caption.setFont(th.font(8.8))
         self.slider_caption.setStyleSheet(f"color: {th.TEXT_3}; background: transparent;")
         self.slider_caption.setAlignment(Qt.AlignCenter)
+        self.slider_caption.setWordWrap(True)
         column.addWidget(self.slider_caption)
 
         column.addStretch(1)
@@ -1264,9 +1287,13 @@ class MainWindow(QMainWindow):
                 self.segments.set_mode(mode)
         else:
             self.segments.set_mode(mode)
+        self._mode = mode
+        game_set = eng.parse_cpulist(snap["game_cpus"])
+        span = sum(1 for group in self.engine.topo.ccds if set(group) & game_set)
         self.stage.set_data(
             self.engine.topo, snap["game_cpus"], snap["test_cpus"],
             active=mode in ("smart", "hard"),
+            warning=span > 1,
         )
         total = len(self.engine.topo.physical_cores())
         self.slider.set_total(total)
@@ -1294,11 +1321,18 @@ class MainWindow(QMainWindow):
         test = eng.parse_cpulist(test_cpus)
         n = self.engine.topo.core_count(game)
         m = self.engine.topo.core_count(test)
-        text = f"{n} / {m} cores"
         span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
         if span > 1:
-            text += f" · game side spans {span} cache domains — fine, slightly slower for the game"
-        self.slider_caption.setText(text)
+            self.slider_caption.setText(
+                f"{n} / {m} — the game side spans {span} cache domains: cross-CCD "
+                "sync runs ~1.5–2× slower (measured), so expect a few % lower FPS "
+                "unless the game truly needs the extra cores")
+            self.slider_caption.setStyleSheet(
+                f"color: {th.AMBER_TEXT}; background: transparent;")
+        else:
+            self.slider_caption.setText(f"{n} / {m} cores — one cache domain per side")
+            self.slider_caption.setStyleSheet(
+                f"color: {th.TEXT_3}; background: transparent;")
 
     def _update_status_text(self, snap):
         mode = snap["mode"]
@@ -1362,6 +1396,14 @@ class MainWindow(QMainWindow):
         self.game_cpus.setText(self.cfg["game_cpus"])
         self.test_cpus.setText(self.cfg["test_cpus"])
         self._update_slider_caption(self.cfg["game_cpus"], self.cfg["test_cpus"])
+        # Reflect the new balance immediately; the engine's next tick makes it
+        # real and the following snapshot confirms it.
+        span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
+        self.stage.set_data(
+            self.engine.topo, self.cfg["game_cpus"], self.cfg["test_cpus"],
+            active=self._mode in ("smart", "hard"),
+            warning=span > 1,
+        )
         self.engine.request("apply_config")
 
     def _auto_toggled(self, checked):
@@ -1479,6 +1521,11 @@ class MainWindow(QMainWindow):
         game, test = split
         notes = [f"{self.engine.topo.core_count(game)} physical cores for the game, "
                  f"{self.engine.topo.core_count(test)} for everything else."]
+        span = sum(1 for group in self.engine.topo.ccds if set(group) & game)
+        if span > 1:
+            notes.append(f"The game set spans {span} L3 cache domains — cross-CCD sync "
+                         "is ~1.5–2× slower, so prefer a CCD-aligned split unless the "
+                         "game needs the extra cores.")
         for label, cpus in (("game", game), ("test", test)):
             split_smt = self.engine.topo.smt_split(cpus)
             if split_smt:
