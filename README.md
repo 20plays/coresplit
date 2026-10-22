@@ -10,12 +10,11 @@ puts it all back when you're done.
 ## The problem
 
 When a test run or an agent works while you game, it competes with the game
-for cores and your frame times spike. Pinning the game to specific cores
-doesn't help, because other programs can still use those cores too. You'd have
-to move every other process away by hand, and keep doing it as new ones spawn.
-And agents love popping up terminal windows that steal your mouse mid-game.
+for cores and your frame times spike. I was playing THE FINALS when all of a 
+sudden my agent runs `vitetest`, my fps drops to 25-40, and I become infuriated.
+it also likes to steal my mouse.
 
-## What it does
+## The solution
 
 While a game is running, CoreSplit moves your other programs to the other half
 of the CPU, and moves everything back once you quit. It notices games through
