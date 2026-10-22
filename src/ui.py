@@ -442,11 +442,40 @@ class SplitStage(QWidget):
         self._total = 0
         self._pos = 0.0
         self._target = 0.0
+        self._warning = False
+        self._samples = deque()  # (monotonic_ts, game_pct, test_pct)
+        self._delay = 1.5        # render delay: one poll, so curves never jump
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(420)
         self._anim.setEasingCurve(QEasingCurve.InOutCubic)
         self._anim.valueChanged.connect(self._on_anim)
-        self._warning = False
+        self._scroll = QTimer(self)
+        self._scroll.setInterval(33)
+        self._scroll.timeout.connect(self.update)
+
+    def add_sample(self, game_pct: float, test_pct: float):
+        now = time.monotonic()
+        if self._samples:
+            gap = now - self._samples[-1][0]
+            if 0.2 < gap < 6.0:
+                self._delay = gap
+        self._samples.append((now,
+                              max(0.0, min(100.0, game_pct)),
+                              max(0.0, min(100.0, test_pct))))
+        cutoff = now - 75.0
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        if not self._scroll.isActive():
+            self._scroll.start()
+
+    def showEvent(self, event):
+        if self._samples:
+            self._scroll.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._scroll.stop()
+        super().hideEvent(event)
 
     def set_data(self, topo, game_cpus, test_cpus, active: bool, warning: bool = False):
         game = eng.parse_cpulist(game_cpus)
@@ -528,6 +557,7 @@ class SplitStage(QWidget):
                 cores=self._game_cores,
                 dot_color=th.mix(th.q("#5b6474"), th.AMBER_C, p),
                 warning=self._warning,
+                samples=self._samples, delay=self._delay, series=0, accent=th.AMBER_C,
             )
             self._panel(
                 painter, other_rect, radius, other_fill, other_border,
@@ -537,12 +567,13 @@ class SplitStage(QWidget):
                 sub=self._other_range, sub_alpha=fade * 0.85,
                 cores=self._other_cores,
                 dot_color=th.mix(th.q("#5b6474"), th.BLUE_C, p),
+                samples=self._samples, delay=self._delay, series=1, accent=th.BLUE_C,
             )
         painter.end()
 
     def _panel(self, painter, rect: QRectF, radius, fill, border, *, label, label_alpha,
                label_color=None, count_n, count_word, count_alpha, sub, sub_alpha, cores,
-               dot_color, warning=False):
+               dot_color, warning=False, samples=None, delay=1.5, series=0, accent=None):
         painter.setPen(QPen(border, 1))
         painter.setBrush(fill)
         painter.drawRoundedRect(rect, radius, radius)
@@ -603,6 +634,62 @@ class SplitStage(QWidget):
         painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, inner_w, 14),
                          int(Qt.AlignLeft | Qt.AlignVCenter), sub)
 
+        # Live percentage, right-aligned on the range row.
+        if samples and sub_alpha > 0.05:
+            cur = samples[-1][1 + series]
+            vc = QColor(label_color)
+            vc.setAlphaF(max(0.0, min(1.0, sub_alpha * 1.3)))
+            painter.setFont(th.font(8.2, QFont.DemiBold, mono=True))
+            painter.setPen(QPen(vc))
+            painter.drawText(QRectF(rect.left() + pad, rect.top() + 76, inner_w, 14),
+                             int(Qt.AlignRight | Qt.AlignVCenter), f"{cur:.0f}%")
+
+        # Per-side usage curve, drawn inside the tile's empty middle band.
+        if samples is not None and accent is not None and len(samples) >= 2:
+            now = time.monotonic()
+            chart_top = rect.top() + 100.0
+            chart_bot = rect.bottom() - 48.0
+            if chart_bot - chart_top > 14.0:
+                clip = QPainterPath()
+                clip.addRoundedRect(QRectF(rect.left() + 1.5, rect.top() + 1.5,
+                                           rect.width() - 3, rect.height() - 3),
+                                    max(1.0, radius - 1.5), max(1.0, radius - 1.5))
+                painter.save()
+                painter.setClipPath(clip)
+                rate = inner_w / 60.0
+                pts = []
+                for (t, gv, tv) in samples:
+                    x = rect.right() - pad - (now - delay - t) * rate
+                    if x < rect.left() + pad:
+                        continue
+                    v = (gv, tv)[series]
+                    y = chart_bot - (max(0.0, min(100.0, v)) / 100.0) * (chart_bot - chart_top)
+                    pts.append(QPointF(x, y))
+                if len(pts) >= 2:
+                    path = QPainterPath(pts[0])
+                    for i in range(1, len(pts)):
+                        px, py = pts[i - 1].x(), pts[i - 1].y()
+                        cx, cy = pts[i].x(), pts[i].y()
+                        path.quadTo(QPointF(px, py), QPointF((px + cx) / 2, (py + cy) / 2))
+                        path.lineTo(pts[i])
+                    fill_path = QPainterPath(path)
+                    fill_path.lineTo(pts[-1].x(), chart_bot)
+                    fill_path.lineTo(pts[0].x(), chart_bot)
+                    fill_path.closeSubpath()
+                    grad = QLinearGradient(0, chart_top, 0, chart_bot)
+                    grad.setColorAt(0.0, th.tint(accent, 90))
+                    grad.setColorAt(1.0, th.tint(accent, 0))
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(grad))
+                    painter.drawPath(fill_path)
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setPen(QPen(th.tint(accent, 235), 1.6))
+                    painter.drawPath(path)
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(accent)
+                    painter.drawEllipse(pts[-1], 2.4, 2.4)
+                painter.restore()
+
         # One dot per physical core, sized to fit the panel.
         n = max(1, len(cores))
         gap = 9.0
@@ -616,138 +703,6 @@ class SplitStage(QWidget):
             x += dot + gap
 
 
-# --------------------------------------------------------------------------- #
-# usage graph
-# --------------------------------------------------------------------------- #
-
-class UsageGraph(QWidget):
-    """Rolling CPU usage for each side of the split, as two filled curves.
-
-    Samples arrive once per engine poll (1.5 s); the plot scrolls continuously
-    between them so it reads as live rather than steppy. Percentages are of
-    each side's capacity: a full game side means every game CPU is busy.
-    """
-
-    WINDOW_SECONDS = 60.0
-
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(118)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._samples = deque()  # (monotonic_ts, game_pct, test_pct)
-        self._timer = QTimer(self)
-        self._timer.setInterval(33)
-        self._timer.timeout.connect(self.update)
-
-    def add_sample(self, game_pct: float, test_pct: float):
-        now = time.monotonic()
-        self._samples.append((now, game_pct, test_pct))
-        cutoff = now - self.WINDOW_SECONDS - 5
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
-        if not self._timer.isActive():
-            self._timer.start()
-
-    def showEvent(self, event):
-        if self._samples:
-            self._timer.start()
-        super().showEvent(event)
-
-    def hideEvent(self, event):
-        self._timer.stop()
-        super().hideEvent(event)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        frame = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setPen(QPen(th.q(th.LINE_SOFT), 1))
-        painter.setBrush(th.q(th.SURFACE))
-        painter.drawRoundedRect(frame, 16, 16)
-
-        pad_l, pad_r, pad_t, pad_b = 16.0, 16.0, 32.0, 12.0
-        plot = QRectF(pad_l, pad_t, self.width() - pad_l - pad_r,
-                      self.height() - pad_t - pad_b)
-        now = time.monotonic()
-        rate = plot.width() / self.WINDOW_SECONDS
-
-        # Midline at 50% of capacity, and the baseline.
-        pen = QPen(th.LINE_C, 1)
-        painter.setPen(pen)
-        painter.drawLine(QPointF(plot.left(), plot.center().y()),
-                         QPointF(plot.right(), plot.center().y()))
-
-        def series(index, accent):
-            points = []
-            for t, g, tl in self._samples:
-                value = (g, tl)[index]
-                x = plot.right() - (now - t) * rate
-                if x < plot.left():
-                    continue
-                y = plot.bottom() - (value / 100.0) * plot.height()
-                points.append((x, max(plot.top(), min(plot.bottom(), y))))
-            if not points:
-                return None
-            path = QPainterPath(QPointF(*points[0]))
-            for i in range(1, len(points)):
-                x0, y0 = points[i - 1]
-                x1, y1 = points[i]
-                mid = QPointF((x0 + x1) / 2, (y0 + y1) / 2)
-                path.quadTo(QPointF(x0, y0), mid)
-                path.lineTo(QPointF(x1, y1))
-            fill = QPainterPath(path)
-            fill.lineTo(points[-1][0], plot.bottom())
-            fill.lineTo(points[0][0], plot.bottom())
-            fill.closeSubpath()
-            grad = QLinearGradient(0, plot.top(), 0, plot.bottom())
-            grad.setColorAt(0.0, th.tint(accent, 75))
-            grad.setColorAt(1.0, th.tint(accent, 0))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(grad))
-            painter.drawPath(fill)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(th.tint(accent, 230), 1.6))
-            painter.drawPath(path)
-            lx, ly = points[-1]
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(accent)
-            painter.drawEllipse(QPointF(lx, ly), 2.6, 2.6)
-            return points[-1]
-
-        series(0, th.AMBER_C)
-        series(1, th.BLUE_C)
-
-        # Legend with the live values.
-        painter.setFont(th.font(8.8, QFont.DemiBold))
-        if self._samples:
-            _, g, t = self._samples[-1]
-            left_text = f"Game side · {g:.0f}%"
-            right_text = f"{t:.0f}% · Test side"
-        else:
-            left_text, right_text = "Game side", "Test side"
-        legend_y = 20.0
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(th.AMBER_C)
-        painter.drawEllipse(QPointF(pad_l + 3, legend_y), 3.2, 3.2)
-        painter.setPen(QPen(th.TEXT_2_C))
-        painter.drawText(QPointF(pad_l + 12, legend_y + 4), left_text)
-        right_metrics = QFontMetrics(painter.font())
-        right_w = right_metrics.horizontalAdvance(right_text)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(th.BLUE_C)
-        painter.drawEllipse(QPointF(self.width() - pad_r - right_w - 11, legend_y), 3.2, 3.2)
-        painter.setPen(QPen(th.TEXT_2_C))
-        painter.drawText(QPointF(self.width() - pad_r - right_w, legend_y + 4), right_text)
-
-        if len(self._samples) < 2:
-            painter.setFont(th.font(8.8))
-            painter.setPen(QPen(th.TEXT_3_C))
-            painter.drawText(plot, int(Qt.AlignCenter), "gathering samples…")
-        painter.end()
-
-
-# --------------------------------------------------------------------------- #
-# process table
 # --------------------------------------------------------------------------- #
 
 class ProcessModel(QAbstractTableModel):
@@ -970,8 +925,8 @@ class MainWindow(QMainWindow):
         self.bridge = bridge
         self.cfg = config
         self.setWindowTitle("CoreSplit")
-        self.resize(1000, 780)
-        self.setMinimumSize(880, 700)
+        self.resize(1000, 720)
+        self.setMinimumSize(880, 660)
         self._pending_mode: str | None = None
         self._mode = "off"
         self._pending_timer = QTimer(self)
@@ -1067,16 +1022,7 @@ class MainWindow(QMainWindow):
         stage_holder.addStretch(1)
         column.addLayout(stage_holder)
 
-        column.addSpacing(12)
-
-        graph_holder = QHBoxLayout()
-        graph_holder.addStretch(1)
-        self.graph = UsageGraph()
-        graph_holder.addWidget(self.graph, 12)
-        graph_holder.addStretch(1)
-        column.addLayout(graph_holder)
-
-        column.addSpacing(16)
+        column.addSpacing(20)
 
         slider_holder = QHBoxLayout()
         slider_holder.addStretch(1)
@@ -1461,13 +1407,15 @@ class MainWindow(QMainWindow):
                 self.engine.topo.core_count(eng.parse_cpulist(snap["game_cpus"])))
         self._update_slider_caption(snap["game_cpus"], snap["test_cpus"])
 
-        # Per-side usage as a share of each side's capacity.
+        # Per-side usage as a share of each side's capacity, charted in the tiles.
+        # proc cpu is percent-of-one-core, so a fully busy side sums to ~100*n;
+        # share of capacity is therefore sum / n.
         g_cpu = sum(row["cpu"] for row in snap["procs"] if row["role"] == "game")
         t_cpu = sum(row["cpu"] for row in snap["procs"] if row["role"] == "test")
         g_cap = max(1, len(eng.parse_cpulist(snap["game_cpus"])))
         t_cap = max(1, len(eng.parse_cpulist(snap["test_cpus"])))
-        self.graph.add_sample(min(100.0, 100.0 * g_cpu / g_cap),
-                              min(100.0, 100.0 * t_cpu / t_cap))
+        self.stage.add_sample(min(100.0, g_cpu / g_cap),
+                              min(100.0, t_cpu / t_cap))
 
         self._update_status_text(snap)
         self.model.set_rows(snap["procs"])
