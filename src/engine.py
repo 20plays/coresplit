@@ -125,6 +125,9 @@ DEFAULT_CONFIG = {
     # With two games open, the background one gets its own cores on the game
     # side but yields priority to the one being played.
     "favour_foreground": True,
+    # The game always wins: parked work runs at the lowest priority and
+    # yields disk I/O, in every pinning mode, even with a single game.
+    "game_priority": True,
     "agent_scopes": [
         "app-zcode-", "app-opencode-", "app-code-", "app-ai.opencode",
         "app-com.heroicgameslauncher.hgl@",
@@ -1122,11 +1125,13 @@ class Engine:
             parts.append(f"{name} ({role}) -> {format_cpulist(slices[index])}")
         self._log(f"{len(per_root)} games share the game side: " + "; ".join(parts))
 
-    def _set_nice(self, pid, value):
+    def _set_nice(self, pid, value) -> bool:
         try:
             os.setpriority(os.PRIO_PROCESS, pid, value)
+            return True
         except OSError:
-            pass
+            # Raising a priority needs privileges; lowering never does.
+            return False
 
     def _pin(self, proc, mask, role, background=False):
         if not mask:
@@ -1141,21 +1146,23 @@ class Engine:
             self._log(f"cannot pin pid {proc.pid} ({proc.comm}); leaving it unconstrained")
             return
         if role != "test":
-            # A background game keeps its own cores but yields priority to the
-            # one actually being played.
+            entry = self._state.pinned.get(proc.pid)
             if background and self.cfg["favour_foreground"] and proc.nice < 5:
-                entry = self._state.pinned.get(proc.pid)
+                # A background game keeps its own cores but yields priority to
+                # the one actually being played.
                 if entry is not None and entry.nice is None:
                     entry.nice = proc.nice
                 self._set_nice(proc.pid, 5)
+            elif not background and self.cfg["game_priority"] and proc.nice > -5:
+                # Best-effort raise for the game itself; unprivileged installs
+                # cannot go below 0, and there nothing is lost by trying.
+                if self._set_nice(proc.pid, -5) and entry is not None and entry.nice is None:
+                    entry.nice = proc.nice
             return
-        if self.cfg["smart_ioprio"]:
+        if self.cfg["smart_ioprio"] or self.cfg["game_priority"]:
             _set_ioprio(proc.pid, 3, 0)
-        if self.cfg["smart_renice"] and proc.nice < 19:
-            try:
-                os.setpriority(os.PRIO_PROCESS, proc.pid, 19)
-            except OSError:
-                pass
+        if (self.cfg["smart_renice"] or self.cfg["game_priority"]) and proc.nice < 19:
+            self._set_nice(proc.pid, 19)
 
     def _restore_missing(self, procs, desired):
         for pid in list(self._state.pinned):

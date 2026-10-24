@@ -1484,21 +1484,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(caps("Behaviour", th.TEXT_3, 8.2))
         layout.addSpacing(4)
 
-        self.renice_check = Switch()
-        self.renice_check.setChecked(bool(self.cfg["smart_renice"]))
-        self.renice_check.toggled.connect(self._options_changed)
+        self.priority_check = Switch()
+        self.priority_check.setChecked(bool(self.cfg["game_priority"]))
+        self.priority_check.toggled.connect(self._options_changed)
         layout.addWidget(SettingRow(
-            "Lower priority of test processes",
-            "Reniced, so parked work never wins a scheduling fight with the game.",
-            self.renice_check))
-
-        self.ioprio_check = Switch()
-        self.ioprio_check.setChecked(bool(self.cfg["smart_ioprio"]))
-        self.ioprio_check.toggled.connect(self._options_changed)
-        layout.addWidget(SettingRow(
-            "Deprioritise test disk I/O",
-            "Parked processes wait behind the game for disk access too.",
-            self.ioprio_check))
+            "Prioritise the game",
+            "Parked processes run at the lowest priority and yield disk I/O, so "
+            "the game always wins the cores it is given — even with one game.",
+            self.priority_check))
 
         self.favour_check = Switch()
         self.favour_check.setChecked(bool(self.cfg["favour_foreground"]))
@@ -1758,8 +1751,7 @@ class MainWindow(QMainWindow):
         self.cfg.save()
 
     def _options_changed(self):
-        self.cfg["smart_renice"] = self.renice_check.isChecked()
-        self.cfg["smart_ioprio"] = self.ioprio_check.isChecked()
+        self.cfg["game_priority"] = self.priority_check.isChecked()
         self.cfg["favour_foreground"] = self.favour_check.isChecked()
         self.cfg.save()
         self.engine.request("apply_config")
