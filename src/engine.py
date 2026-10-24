@@ -930,7 +930,10 @@ class Engine:
             stack.extend(children.get(pid, ()))
 
         # Detached wine/proton helpers can lose the parent link, so also match
-        # anything whose executable lives in the game's install directory.
+        # anything living in the game's install directory — including the
+        # Proton runtime the game itself runs on. Wine re-parents and maps
+        # drives (S:\...), so directories are matched as substrings of a
+        # normalised path rather than unix prefixes.
         dirs = set()
         for pid in roots:
             proc = procs.get(pid)
@@ -939,12 +942,17 @@ class Engine:
             marker = _install_root(proc.exe or proc.cmdline)
             if marker:
                 dirs.add(marker)
+            haystack = f"{proc.exe} {proc.cmdline}".replace("\\", "/")
+            for match in re.finditer(r"steamapps/common/([^/]+)/", haystack):
+                dirs.add(f"steamapps/common/{match.group(1)}")
+            if match := re.search(r"compatdata/(\d+)/", haystack):
+                dirs.add(f"compatdata/{match.group(1)}/")
         if dirs:
             for proc in procs.values():
                 if proc.pid in seen:
                     continue
-                location = proc.exe or proc.cmdline
-                if location and any(location.startswith(d) for d in dirs):
+                location = f"{proc.exe} {proc.cmdline}".replace("\\", "/")
+                if location and any(d in location for d in dirs):
                     seen.add(proc.pid)
         return seen
 

@@ -138,6 +138,14 @@ def _proc_name(proc) -> str:
     return (_basename(proc.exe) or proc.comm).lower()
 
 
+def _steam_title_marker(location: str) -> bool:
+    """True when a steamapps path names a real title, not a runtime."""
+    for match in re.finditer(r"/steamapps/common/([^/]+)", location):
+        if match.group(1).lower() not in RUNTIME_DIRS:
+            return True
+    return "/compatdata/" in location
+
+
 def _is_client(proc) -> bool:
     name = _proc_name(proc)
     if _name_in(name, CLIENT_NAMES) or _name_in(name, RUNTIME_HELPER_NAMES):
@@ -214,26 +222,28 @@ def _game_name(proc) -> str:
 
     Wine re-execs everything through `wine64-preloader`, so /proc/pid/exe is
     useless for Proton titles; the real executable path is in cmdline. argv is
-    used so paths containing spaces survive intact.
+    used so paths containing spaces survive intact. Windows-style paths are
+    normalised to forward slashes first.
     """
-    for candidate in (proc.exe, proc.cmdline):
-        match = re.search(r"/steamapps/common/([^/]+)", candidate or "")
-        if match:
+    haystack = f"{proc.exe} {proc.cmdline}".replace("\\", "/")
+    for match in re.finditer(r"/steamapps/common/([^/]+)", haystack):
+        # SteamLinuxRuntime and Proton live in steamapps/common too; keep
+        # scanning until a real title directory turns up.
+        if match.group(1).lower() not in RUNTIME_DIRS:
             return match.group(1)
-    match = re.search(r"/compatdata/(\d+)/", f"{proc.exe} {proc.cmdline}")
-    if match:
+    if match := re.search(r"/compatdata/(\d+)/", haystack):
         return f"app {match.group(1)}"
 
     for token in _argv(proc):
         if not token.lower().endswith(".exe"):
             continue
-        lowered = token.lower()
+        lowered = token.replace("\\", "/").lower()
         if any(part in lowered for part in TOOL_PATH_PARTS):
             continue
-        folder = token.rsplit("/", 1)[0].rsplit("/", 1)[-1] if "/" in token else ""
-        if folder and folder.lower() not in ("drive_c", "bin", "windows", "system32"):
+        folder = lowered.rsplit("/", 1)[0].rsplit("/", 1)[-1] if "/" in lowered else ""
+        if folder and folder not in ("drive_c", "bin", "windows", "system32"):
             return folder
-        return token.rsplit("/", 1)[-1]
+        return lowered.rsplit("/", 1)[-1]
 
     return _basename(proc.exe) or proc.comm
 
@@ -375,7 +385,18 @@ class Detector:
             proc = procs.get(info.pid)
             if proc is not None:
                 info.name = _display_name(proc, procs)
-        return roots
+        # Wine re-parents the game away from its launcher tree, so one game can
+        # surface as several roots; roots naming the same title are one game.
+        # (The engine's install-directory fallback still pins every process.)
+        unique = []
+        seen = set()
+        for info in roots:
+            key = info.name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(info)
+        return unique
 
     def _match(self, proc):
         if _is_client(proc):
@@ -385,7 +406,7 @@ class Detector:
             return GameInfo(proc.pid, _game_name(proc), proc.exe, "gamemode")
 
         if self.use_paths and not _is_runtime_tool(proc) and not _is_shell(proc):
-            location = f"{proc.exe} {proc.cmdline}"
+            location = f"{proc.exe} {proc.cmdline}".replace("\\", "/")
             for marker in self.cfg["game_path_markers"]:
                 if marker and marker in location:
                     return GameInfo(proc.pid, _game_name(proc), proc.exe, "install path")
@@ -397,6 +418,14 @@ class Detector:
                 if scope in proc.cgroup:
                     if _name_in(_proc_name(proc), LAUNCHER_UI_NAMES):
                         return None
+                    return GameInfo(proc.pid, _game_name(proc), proc.exe, "launcher scope")
+            # Newer Steam runs the client and its games inside one user service
+            # (app-steam@<uuid>.service) instead of per-launch scopes. The
+            # service also holds the client and all of Steam's plumbing, so a
+            # match there needs a real title path, not just any steamapps one.
+            if "app-steam@" in proc.cgroup:
+                location = f"{proc.exe} {proc.cmdline}".replace("\\", "/")
+                if _steam_title_marker(location):
                     return GameInfo(proc.pid, _game_name(proc), proc.exe, "launcher scope")
 
         if self.use_kwin:
