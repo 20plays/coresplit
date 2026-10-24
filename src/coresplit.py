@@ -7,7 +7,8 @@ Usage:
     coresplit show            raise the window (ignored while a game is protected)
     coresplit focusguard on|off   block agent windows from stealing focus
     coresplit status          print current state as JSON
-    coresplit smart|hard|off  switch mode in a running instance
+    coresplit boost|smart|hard|off
+                          switch mode in a running instance
     coresplit reset           release every pin (works without the app running)
     coresplit detect          show what the game detector currently sees
     coresplit daemon          headless mode, no GUI

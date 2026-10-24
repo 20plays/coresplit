@@ -218,6 +218,9 @@ def _icon_pixmap(mode: str, size: int) -> QPixmap:
 
     left = AMBER_C if mode != "off" else q("#5b6474")
     right = BLUE_C if mode != "off" else q("#4a5261")
+    if mode == "boost":
+        # No split in boost mode: one solid, warm tile.
+        left = right = AMBER_C
 
     clip = QPainterPath()
     clip.addRoundedRect(rect, radius, radius)

@@ -163,10 +163,10 @@ class Switch(QWidget):
 # --------------------------------------------------------------------------- #
 
 class ModeSelector(QWidget):
-    """Three-way selector with a sliding thumb. The one primary control."""
+    """Four-way selector with a sliding thumb. The one primary control."""
 
     changed = Signal(str)
-    OPTIONS = (("off", "Off"), ("smart", "Smart"), ("hard", "Hard"))
+    OPTIONS = (("off", "Off"), ("boost", "Boost"), ("smart", "Smart"), ("hard", "Hard"))
 
     def __init__(self):
         super().__init__()
@@ -227,7 +227,8 @@ class ModeSelector(QWidget):
         painter.drawRoundedRect(track, 22, 22)
 
         key = self.mode()
-        accent = {"off": th.q("#262d3a"), "smart": th.BLUE_C, "hard": th.AMBER_C}[key]
+        accent = {"off": th.q("#262d3a"), "boost": th.tint(th.AMBER_C, 45),
+                  "smart": th.BLUE_C, "hard": th.AMBER_C}[key]
         if self._busy:
             accent = th.mix(accent, th.q(th.INK), 0.45)
         thumb = self._segment_rect(self._pos)
@@ -1104,6 +1105,7 @@ class SettingRow(QWidget):
 
 MODE_DESCRIPTIONS = {
     "off": "Everything shares every core. Nothing is pinned.",
+    "boost": "Nothing is pinned — the game simply outranks everything on every core.",
     "smart": "Recognised test and agent processes are parked on the other side.",
     "hard": "Everything except the game is parked on the other side.",
 }
@@ -1285,6 +1287,7 @@ class MainWindow(QMainWindow):
         self.auto_mode = QComboBox()
         self.auto_mode.addItem("Hard split", "hard")
         self.auto_mode.addItem("Smart split", "smart")
+        self.auto_mode.addItem("Boost — no split", "boost")
         index = self.auto_mode.findData(self.cfg["auto_mode"])
         self.auto_mode.setCurrentIndex(max(0, index))
         self.auto_mode.setCursor(Qt.PointingHandCursor)
@@ -1680,6 +1683,24 @@ class MainWindow(QMainWindow):
             self.subtitle.setText(
                 f"All {self.engine.topo.core_count(self.engine.topo.all_cpus)} physical cores "
                 "serve whatever you run.")
+        elif mode == "boost":
+            if game:
+                self.eyebrow.setText("Boost · protecting")
+                self.eyebrow.setStyleSheet(f"color: {th.AMBER_TEXT}; background: transparent;")
+                self.title.setText(game["name"])
+                n = counts.get("game", 0)
+                games = snap.get("games") or [game["name"]]
+                others = " + ".join(games[1:])
+                sharing = f" · sharing the spotlight with {others}" if others else ""
+                self.subtitle.setText(
+                    f"{n} process{'es' if n != 1 else ''} run at full speed while everything "
+                    f"else yields{sharing} · no cores are reserved")
+            else:
+                self.eyebrow.setText("Boost · waiting")
+                self.eyebrow.setStyleSheet(f"color: {th.AMBER_TEXT}; background: transparent;")
+                self.title.setText("Waiting for a game")
+                self.subtitle.setText(
+                    "Nothing is pinned — priorities apply the moment a game starts.")
         else:
             word = "Hard split" if mode == "hard" else "Smart split"
             accent = th.AMBER_TEXT if mode == "hard" else th.BLUE_TEXT

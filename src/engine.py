@@ -30,7 +30,7 @@ try:
 except (ValueError, OSError):  # pragma: no cover - non-Linux
     CLOCK_TICKS = 100
 
-MODES = ("off", "smart", "hard")
+MODES = ("off", "boost", "smart", "hard")
 
 # /proc/<pid>/stat reports comm truncated to 15 characters, so a configured name
 # like "kwin_wayland_wrapper" arrives as "kwin_wayland_wr". Every name comparison
@@ -627,6 +627,11 @@ class EngineState:
         # inherit a CCD mask at fork time and may never be scanned before the
         # restore, so they need a sweep of their own.
         self.engaged_ticks: int = 0
+        # Boost mode: pid -> original nice, recorded when we deprioritised the
+        # process instead of pinning it. Nothing about affinity changes here.
+        self.boost_nice: dict[int, int] = {}
+        self.boost_bg: set[int] = set()   # pids reniced as background games
+        self.boost_active: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -995,6 +1000,9 @@ class Engine:
 
     def _apply(self, procs):
         state = self._state
+        if state.mode == "boost":
+            self._apply_boost(procs)
+            return
         if state.mode == "off" and not state.manual_roles:
             self._restore_missing(procs, desired={})
             return
@@ -1097,6 +1105,98 @@ class Engine:
         self._restore_missing(procs, desired)
         state.roles = dict(desired)
 
+    def _restore_boost(self, reason=""):
+        """Hand every deprioritised process its original nice back."""
+        if not self._state.boost_nice:
+            self._state.boost_active = False
+            return
+        count = len(self._state.boost_nice)
+        for pid, nice in self._state.boost_nice.items():
+            self._set_nice(pid, nice)
+        self._state.boost_nice.clear()
+        self._state.boost_bg.clear()
+        if self._state.boost_active:
+            self._state.boost_active = False
+            message = f"boost released: {count} process(es) back to normal priority"
+            if reason:
+                message += f" ({reason})"
+            self._log(message)
+
+    def _apply_boost(self, procs):
+        """Boost mode: no affinity changes at all.
+
+        While a game runs, every other own-user process sinks to the lowest
+        priority and yields disk I/O, so the game outranks all cores without
+        the machine being split. Everything returns to normal the moment the
+        game exits, the mode changes, or CoreSplit stops.
+        """
+        state = self._state
+        game = state.game
+        if game is None:
+            self._restore_boost("game exited")
+            return
+
+        roots = [game.pid]
+        roots.extend(pid for pid in getattr(game, "extra_roots", ()) if pid in procs)
+        per_root = [(pid, self._game_subtree(procs, [pid])) for pid in roots]
+        game_set = set()
+        for _pid, tree in per_root:
+            game_set |= tree
+        state.game_set = game_set
+
+        my_uid = os.getuid()
+        skip = set(self.cfg["protected"]) | set(self.cfg["unpinnable"]) | set(self.cfg["floating"])
+        boost_nice = state.boost_nice
+
+        for proc in procs.values():
+            if proc.pid in game_set or proc.uid != my_uid:
+                continue
+            if name_in(proc.comm, skip):
+                continue
+            if proc.pid not in boost_nice and proc.nice < 19:
+                boost_nice[proc.pid] = proc.nice
+            if proc.nice < 19:
+                self._set_nice(proc.pid, 19)
+            _set_ioprio(proc.pid, 3, 0)
+        for pid in [pid for pid in boost_nice if pid not in procs]:
+            # The process left; dropping the record. Restoring a reused pid to
+            # its default nice is harmless.
+            self._set_nice(pid, boost_nice.pop(pid))
+            state.boost_bg.discard(pid)
+
+        # Background games yield to the played one here too, and the played
+        # one gets the same best-effort raise the split gives it. The scan's
+        # nice is one tick stale, so records are handed back before re-raising.
+        if len(per_root) > 1 and self.cfg["favour_foreground"]:
+            for _pid, tree in per_root[1:]:
+                for member in tree:
+                    proc = procs.get(member)
+                    if proc is None or proc.nice >= 5:
+                        continue
+                    if member not in boost_nice:
+                        boost_nice[member] = proc.nice
+                    state.boost_bg.add(member)
+                    self._set_nice(member, 5)
+        if self.cfg["game_priority"]:
+            for member in per_root[0][1]:
+                proc = procs.get(member)
+                if proc is None:
+                    continue
+                if member in state.boost_bg:
+                    # A background game that just became the played one.
+                    if member in boost_nice:
+                        proc.nice = boost_nice.pop(member)
+                        self._set_nice(member, proc.nice)
+                    state.boost_bg.discard(member)
+                if member not in boost_nice and proc.nice > -5:
+                    if self._set_nice(member, -5):
+                        boost_nice[member] = proc.nice
+
+        if not state.boost_active:
+            state.boost_active = True
+            self._log(f"boost: the game outranks everything on all cores; "
+                      f"{len(boost_nice)} process(es) deprioritised, none pinned")
+
     def _log_pins(self, newly):
         """Games get a line each; background work is summarised to stay readable."""
         for proc in newly["game"]:
@@ -1190,6 +1290,7 @@ class Engine:
             set_affinity(pid, entry.orig)
 
     def _restore_all(self, reason=""):
+        self._restore_boost(reason)
         if not self._state.pinned and not self._state.engaged_ticks:
             return
         count = len(self._state.pinned)
