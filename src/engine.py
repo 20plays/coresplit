@@ -602,6 +602,33 @@ def set_affinity(pid: int, cpus) -> int:
     return updated
 
 
+def _sweep_threads(pid: int, mask) -> int:
+    """Re-pin any thread of `pid` that escaped `mask`.
+
+    Games reassign their own threads at runtime (Unreal binds render and task
+    threads explicitly), and a poll only sees the main thread's affinity, so
+    escaped threads are found by walking /proc/<pid>/task. Threads the game
+    restricted to somewhere inside `mask` are left alone — that is deliberate
+    placement, and better cache behaviour.
+    """
+    want = set(mask)
+    fixed = 0
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return 0
+    for tid in tids:
+        try:
+            current = os.sched_getaffinity(int(tid))
+            if not set(current) - want:
+                continue
+            os.sched_setaffinity(int(tid), mask)
+            fixed += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+    return fixed
+
+
 # --------------------------------------------------------------------------- #
 # state
 # --------------------------------------------------------------------------- #
@@ -1067,6 +1094,7 @@ class Engine:
 
         game_mask, test_mask = self.game_mask, self.test_mask
         newly: dict[str, list[ProcInfo]] = {"game": [], "test": []}
+        thread_masks: dict[int, set] = {}
         for pid, role in desired.items():
             proc = procs.get(pid)
             if proc is None:
@@ -1075,6 +1103,7 @@ class Engine:
                 want = game_masks.get(pid, game_mask)
             else:
                 want = test_mask
+            thread_masks[pid] = want
             entry = state.pinned.get(pid)
             if entry is not None and entry.nice is not None and pid not in background:
                 # No longer a background game (became primary, or its role
@@ -1104,6 +1133,13 @@ class Engine:
         self._log_pins(newly)
         self._restore_missing(procs, desired)
         state.roles = dict(desired)
+
+        # Games move their own threads around at runtime, and the poll above
+        # only sees the main thread; periodically pull escapees back in.
+        self._thread_sweep = getattr(self, "_thread_sweep", 0) + 1
+        if thread_masks and self._thread_sweep % 4 == 0:
+            for pid, mask in thread_masks.items():
+                _sweep_threads(pid, mask)
 
     def _restore_boost(self, reason=""):
         """Hand every deprioritised process its original nice back."""
